@@ -32,8 +32,8 @@ python azure_reasoning_complete.py \
     --path_to_database /home/lrshi/llm/ehrshot-benchmark/EHRSHOT_ASSETS/femr/extract \
     --path_to_labels_dir /home/lrshi/llm/ehrshot-benchmark/EHRSHOT_ASSETS/benchmark \
     --task_to_instructions /home/lrshi/llm/ehrshot-benchmark/ehrshot/serialization/task_to_instructions.json \
-    --num_samples 50 \
-    --max_examples 10 \
+    --num_samples 3 \
+    --max_examples 5 \
     --output_file /home/lrshi/llm/ehrshot-benchmark/ehrshot/reasoning_output/azure_reasoning_traces.json \
     --temperature 0.7 \
     --max_tokens 4096
