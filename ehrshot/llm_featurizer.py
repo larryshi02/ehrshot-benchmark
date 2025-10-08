@@ -19,6 +19,7 @@ import multiprocessing
 from femr.labelers import Label
 from femr.extension import datasets as extension_datasets
 from serialization.ehr_serializer import SerializationStrategy, AGGREGATED_EVENTS_CODES_LOINC
+import os
 
 PatientDatabase = extension_datasets.PatientDatabase
 Ontology = extension_datasets.Ontology
@@ -39,18 +40,28 @@ class LabelTask(Label):
         self.task = task
 
 def load_labeled_patients_with_tasks(filename: str) -> Dict[int, List[Tuple[datetime, str]]]:
+    """Load labeled patients from a task-specific label file.
+    
+    Args:
+        filename: Path to the task-specific label file (e.g. lab_thrombocytopenia/labeled_patients.csv)
+        
+    Returns:
+        Dictionary mapping patient IDs to list of (timestamp, task) tuples
+    """
     with open(filename, "r") as f:
         reader = csv.DictReader(f)
         rows = list(reader)
         assert len(rows) != 0, "Must have at least one label to load it"
 
+        # Extract task name from the directory name
+        task = os.path.basename(os.path.dirname(filename))
+        
         labeled_patients_with_tasks: Dict[int, List[Tuple[datetime, str]]] = collections.defaultdict(list)
         for row in rows:
             time = datetime.fromisoformat(row["prediction_time"])
             if time.second != 0:
                 time = time.replace(second=0)
-            task = row["task"]
-
+            
             labeled_patients_with_tasks[int(row["patient_id"])].append((time, task))
         return labeled_patients_with_tasks
 
@@ -67,16 +78,18 @@ def _get_cache_folder_and_fingerprint(
     
     # For cache folder name combine: serialization_strategy, task_to_instructions not {}, excluded_ontologies, add_condition_parent_concepts
     cache_folder_name = [
-        len(patients_to_labels),
-        sum([len(labels) for labels in patients_to_labels.values()]),
-        llm_featurizer.serialization_strategy,
+        str(len(patients_to_labels)),
+        str(sum([len(labels) for labels in patients_to_labels.values()])),
+        str(llm_featurizer.serialization_strategy),
         'instr-' + str(llm_featurizer.task_to_instructions != {}),
         'eo-' + '-'.join(llm_featurizer.excluded_ontologies),
         'apc-' + str(llm_featurizer.add_condition_parent_concepts)
     ]
     cache_folder_name = '_'.join(cache_folder_name)
     # Create caching fingerprint with hash over patients_to_labels
-    cache_fingerprint = str(hash(tuple(patients_to_labels.items())))
+    # Convert lists to tuples for hashing
+    hashable_items = [(pid, tuple(labels)) for pid, labels in patients_to_labels.items()]
+    cache_fingerprint = str(hash(tuple(hashable_items)))
     return (cache_folder_name, cache_fingerprint)
 
 def preprocess_llm_featurizer(
@@ -85,19 +98,23 @@ def preprocess_llm_featurizer(
     patients_to_labels: Dict[int, List[Tuple[datetime, str]]],
     num_threads: int = 1,
 ):
-    # # Check if cached serialization for this setting exists
-    # cache_dir = f"{database_path}/cache"
-    # cache_folder_name, cache_fingerprint = _get_cache_folder_and_fingerprint(llm_featurizer, patients_to_labels)
-    # cache_path = f"{cache_dir}/{cache_folder_name}"
+    # Check if cached serialization for this setting exists
+    cache_dir = f"{database_path}/cache"
+    cache_folder_name, cache_fingerprint = _get_cache_folder_and_fingerprint(llm_featurizer, patients_to_labels)
+    cache_path = f"{cache_dir}/{cache_folder_name}"
     
-    # # Check if cache folder exists and contains correct fingerprint.txt
-    # if os.path.exists(cache_path):
-    #     with open(f"{cache_path}/fingerprint.txt", "r") as f:
-    #         cached_fingerprint = f.read()
-    #     if cached_fingerprint == cache_fingerprint:
-    #         # Load embeddings from cache
-    #         llm_featurizer.embeddings = np.load(f"{cache_path}/{cache_folder_name}.npy")
-    #         return llm_featurizer
+    # Create cache directory if it doesn't exist
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # Check if cache folder exists and contains correct fingerprint.txt
+    if os.path.exists(cache_path):
+        with open(f"{cache_path}/fingerprint.txt", "r") as f:
+            cached_fingerprint = f.read()
+        if cached_fingerprint == cache_fingerprint:
+            # Load embeddings from cache
+            logger.info(f"Loading cached embeddings from {cache_path}")
+            llm_featurizer.embeddings = np.load(f"{cache_path}/{cache_folder_name}.npy")
+            return llm_featurizer
     
     # Split patients across multiple threads
     patient_ids: List[int] = list(patients_to_labels.keys())
@@ -113,9 +130,15 @@ def preprocess_llm_featurizer(
     # Aggregate the results from all featurizers
     aggregated_featurizer = LLMFeaturizer.aggregate_preprocessed_featurizers(preprocessed_featurizers)
 
+    # Save to cache
+    os.makedirs(cache_path, exist_ok=True)
+    with open(f"{cache_path}/fingerprint.txt", "w") as f:
+        f.write(cache_fingerprint)
+    np.save(f"{cache_path}/{cache_folder_name}.npy", aggregated_featurizer.embeddings)
+    logger.info(f"Saved embeddings to cache at {cache_path}")
+
     return aggregated_featurizer
 
-    
 def _run_llm_featurizer(args: Tuple[str, NDArray, Dict[int, List[Tuple[datetime, str]]], LLMFeaturizer]) -> Tuple[Any, Any, Any, Any, Any]:
     database_path: str = args[0]
     patient_ids: NDArray = args[1]
@@ -227,13 +250,14 @@ class LLMFeaturizer():
         self.pid_to_embedding_idx: Dict[int, List[int]] = {}
         
         # Custom ontologies
-        cpt4 = pd.read_csv('ehrshot/custom_ontologies/cpt4.csv')
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        cpt4 = pd.read_csv(os.path.join(current_dir, 'custom_ontologies', 'cpt4.csv'))
         cpt4 = cpt4.set_index('com.medigy.persist.reference.type.clincial.CPT.code')['label'].to_dict()
-        icd10pcs = pd.read_csv('ehrshot/custom_ontologies/PClassR_v2023-1.csv', skiprows=1)
+        icd10pcs = pd.read_csv(os.path.join(current_dir, 'custom_ontologies', 'PClassR_v2023-1.csv'), skiprows=1)
         icd10pcs.columns = icd10pcs.columns.str.strip("'")
         icd10pcs['ICD-10-PCS CODE'] = icd10pcs['ICD-10-PCS CODE'].str.strip("'")
         icd10pcs = icd10pcs.set_index('ICD-10-PCS CODE')['ICD-10-PCS CODE DESCRIPTION'].to_dict()
-        cvx = pd.read_csv('ehrshot/custom_ontologies/cvx.csv', sep="|", header=None)
+        cvx = pd.read_csv(os.path.join(current_dir, 'custom_ontologies', 'cvx.csv'), sep="|", header=None)
         cvx = dict(zip(cvx.iloc[:, 0], cvx.iloc[:, 2]))
         custom_ontologies = {
             'CPT4': cpt4,

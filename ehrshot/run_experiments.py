@@ -22,16 +22,6 @@ def run_command(command):
         raise Exception(f"Command failed with error code {process.returncode}")
     return ''.join(output_lines)
 
-def check_slurm_jobs_status(job_ids):
-    # Convert list of job IDs to a comma-separated string
-    job_ids_str = ','.join(map(str, job_ids))
-    
-    # Check running or queued jobs using squeue
-    squeue_command = f"squeue --jobs={job_ids_str} --noheader --format=%T"
-    squeue_output = subprocess.getoutput(squeue_command).splitlines()
-    
-    return [] if not squeue_output else [status for status in squeue_output]
-
 def main(args):
     # NOTE: Manually skip steps
     start_from_step = args.start
@@ -55,7 +45,7 @@ def main(args):
         python {args.base_dir}/ehrshot/4_generate_llm_features.py \
         --path_to_database {args.path_to_database} \
         --path_to_labels_dir {args.path_to_labels_dir} \
-        --num_threads {args.num_threads} \
+        --num_threads 1 \
         --is_force_refresh \
         --path_to_features_dir {args.experiment_folder} \
         --text_encoder {args.text_encoder} \
@@ -67,23 +57,6 @@ def main(args):
         """
         run_command(feature_command)
 
-    # Step 1.2: Optional - Also evaluate counts and climbr baselines
-    # TODO: Unclear if these patient representations remain the same for different patient subgroups (e.g., only new_*)
-    # For now just link to representation for all patients via symlinks
-    # feature_files = {
-    #     'count_features': '/home/sthe14/ehrshot-benchmark/EHRSHOT_ASSETS_old/features/count_features.pkl',
-    #     'clmbr_features': '/home/sthe14/ehrshot-benchmark/EHRSHOT_ASSETS_old/features/clmbr_features.pkl',
-    #     'agr_features': '/home/sthe14/ehrshot-benchmark/EHRSHOT_ASSETS_old/features/agr_features.pkl',
-    # }
-    # for feature_name, feature_file in feature_files.items():
-    #     feature_symlink = os.path.join(args.experiment_folder, f'{feature_name}.pkl')
-    #     if not os.path.exists(feature_symlink):
-    #         os.symlink(feature_file, feature_symlink)
-    # print(f"Linked {', '.join(list(feature_files.keys()))} features to {args.experiment_folder}")
-
-    # TODO: Not for all - takes too long on GPU node
-    # return
-            
     # Change into scripts directory
     os.chdir(f"{args.base_dir}/ehrshot/bash_scripts")
 
@@ -91,22 +64,13 @@ def main(args):
     if start_from_step <= 2:
         eval_script = f"{args.base_dir}/ehrshot/bash_scripts/7_eval.sh"
         eval_command = f"""bash {eval_script} \
-        --is_use_slurm \
         --path_to_features_dir {args.experiment_folder} \
         --path_to_output_dir {args.experiment_folder}
         """
-        output = run_command(eval_command)
+        run_command(eval_command)
 
-        # Step 2.1: Check for job completion
-        job_ids = [int(line.split()[-1]) for line in output.split("\n") if "Submitted batch job" in line]
-        print(f"Manual kill command: scancel {' '.join(map(str, job_ids))}")
-        status = check_slurm_jobs_status(job_ids)
-        while status:
-            print(f"Waiting for eval jobs to complete (current status: {[s[0:3] for s in status]})...")
-            time.sleep(15)
-            status = check_slurm_jobs_status(job_ids)
-            if stop_after_eval:
-                return
+        if stop_after_eval:
+            return
             
         # Ensure that all subfolder starting with "guo_", "new_", "lab_", "chexpert" have a all_results.csv file
         tasks = ["guo_", "new_", "lab_", "chexpert"]
@@ -152,22 +116,11 @@ def main(args):
     if args.task_to_instructions:
         files_to_upload.append(args.task_to_instructions)
         
-    # Save slurm log file
-    slurm_log_file_prefix = f'{args.base_dir}/ehrshot/bash_scripts/logs/ehrshot_'
-    slurm_id = os.getenv('SLURM_JOB_ID')
-    slurm_log_file = f"{slurm_log_file_prefix}{slurm_id}.log"
-    if os.path.exists(slurm_log_file):
-        files_to_upload.append(slurm_log_file)
-        
     for file_path in files_to_upload:
         shutil.copy(file_path, args.experiment_folder)
         wandb.save(os.path.join(args.experiment_folder, os.path.basename(file_path)))
 
     print("Experiment completed and results uploaded to wandb.")
-
-    # TODO
-    # Sleep for 60 minutes to allow for manual inspection of results
-    # time.sleep(3600)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run EHRShot experiments")
