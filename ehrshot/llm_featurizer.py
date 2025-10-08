@@ -39,30 +39,33 @@ class LabelTask(Label):
         super().__init__(time, value)
         self.task = task
 
-def load_labeled_patients_with_tasks(filename: str) -> Dict[int, List[Tuple[datetime, str]]]:
+def load_labeled_patients_with_tasks(filename: str) -> Dict[int, List[Tuple[datetime, bool]]]:
     """Load labeled patients from a task-specific label file.
     
     Args:
         filename: Path to the task-specific label file (e.g. lab_thrombocytopenia/labeled_patients.csv)
         
     Returns:
-        Dictionary mapping patient IDs to list of (timestamp, task) tuples
+        Dictionary mapping patient IDs to list of (timestamp, bool_value) tuples
     """
     with open(filename, "r") as f:
         reader = csv.DictReader(f)
         rows = list(reader)
         assert len(rows) != 0, "Must have at least one label to load it"
 
-        # Extract task name from the directory name
+        # Extract task name from the directory name (for reference, not used in return)
         task = os.path.basename(os.path.dirname(filename))
         
-        labeled_patients_with_tasks: Dict[int, List[Tuple[datetime, str]]] = collections.defaultdict(list)
+        labeled_patients_with_tasks: Dict[int, List[Tuple[datetime, bool]]] = collections.defaultdict(list)
         for row in rows:
             time = datetime.fromisoformat(row["prediction_time"])
             if time.second != 0:
                 time = time.replace(second=0)
             
-            labeled_patients_with_tasks[int(row["patient_id"])].append((time, task))
+            # Convert string 'True'/'False' to boolean
+            value = row["value"] == "True"
+            
+            labeled_patients_with_tasks[int(row["patient_id"])].append((time, value))
         return labeled_patients_with_tasks
 
 def _run_llm_preprocess_featurizer(task):
@@ -73,7 +76,7 @@ def _run_llm_preprocess_featurizer(task):
 
 def _get_cache_folder_and_fingerprint(
     llm_featurizer: LLMFeaturizer,
-    patients_to_labels: Dict[int, List[Tuple[datetime, str]]]
+    patients_to_labels: Dict[int, List[Tuple[datetime, bool]]]
 ) -> Tuple[str, str]:
     
     # For cache folder name combine: serialization_strategy, task_to_instructions not {}, excluded_ontologies, add_condition_parent_concepts
@@ -95,7 +98,7 @@ def _get_cache_folder_and_fingerprint(
 def preprocess_llm_featurizer(
     database_path: str,
     llm_featurizer: LLMFeaturizer,
-    patients_to_labels: Dict[int, List[Tuple[datetime, str]]],
+    patients_to_labels: Dict[int, List[Tuple[datetime, bool]]],
     num_threads: int = 1,
 ):
     # Check if cached serialization for this setting exists
@@ -139,10 +142,10 @@ def preprocess_llm_featurizer(
 
     return aggregated_featurizer
 
-def _run_llm_featurizer(args: Tuple[str, NDArray, Dict[int, List[Tuple[datetime, str]]], LLMFeaturizer]) -> Tuple[Any, Any, Any, Any, Any]:
+def _run_llm_featurizer(args: Tuple[str, NDArray, Dict[int, List[Tuple[datetime, bool]]], LLMFeaturizer]) -> Tuple[Any, Any, Any, Any, Any]:
     database_path: str = args[0]
     patient_ids: NDArray = args[1]
-    patients_to_labels: Dict[int, List[Tuple[datetime, str]]] = args[2]
+    patients_to_labels: Dict[int, List[Tuple[datetime, bool]]] = args[2]
     featurizer: LLMFeaturizer = args[3]
 
     # Load patients + ontology
@@ -181,7 +184,7 @@ def _run_llm_featurizer(args: Tuple[str, NDArray, Dict[int, List[Tuple[datetime,
 
 def featurize_llm_featurizer(
         database_path: str,
-        patients_to_labels: Dict[int, List[Tuple[datetime, str]]],
+        patients_to_labels: Dict[int, List[Tuple[datetime, bool]]],
         llm_featurizer: LLMFeaturizer,
         num_threads: int = 1,
     ) -> Tuple[

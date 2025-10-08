@@ -69,7 +69,10 @@ class ReasoningExample:
                  task_instruction: str,
                  reasoning_trace: Optional[str] = None,
                  prediction: Optional[str] = None,
-                 is_correct: Optional[bool] = None):
+                 is_correct: Optional[bool] = None,
+                 prompt_tokens: Optional[int] = None,
+                 completion_tokens: Optional[int] = None,
+                 total_tokens: Optional[int] = None):
         self.patient_id = patient_id
         self.label_time = label_time
         self.label_value = label_value
@@ -80,6 +83,9 @@ class ReasoningExample:
         self.reasoning_trace = reasoning_trace
         self.prediction = prediction
         self.is_correct = is_correct
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.total_tokens = total_tokens
     
     def to_dict(self):
         return {
@@ -92,7 +98,10 @@ class ReasoningExample:
             'task_instruction': self.task_instruction,
             'reasoning_trace': self.reasoning_trace,
             'prediction': self.prediction,
-            'is_correct': self.is_correct
+            'is_correct': self.is_correct,
+            'prompt_tokens': self.prompt_tokens,
+            'completion_tokens': self.completion_tokens,
+            'total_tokens': self.total_tokens
         }
 
 
@@ -138,8 +147,8 @@ Reasoning:"""
         # Default to negative if unclear
         return "Negative"
     
-    def _generate_response(self, prompt: str) -> str:
-        """Generate response from Azure OpenAI"""
+    def _generate_response(self, prompt: str) -> tuple[str, dict]:
+        """Generate response from Azure OpenAI and return content with usage info"""
         try:
             response = self.client.chat.completions.create(
                 messages=[
@@ -158,19 +167,26 @@ Reasoning:"""
                 model=self.config.deployment
             )
             
-            return response.choices[0].message.content.strip()
+            content = response.choices[0].message.content.strip()
+            usage = {
+                'prompt_tokens': response.usage.prompt_tokens if response.usage else None,
+                'completion_tokens': response.usage.completion_tokens if response.usage else None,
+                'total_tokens': response.usage.total_tokens if response.usage else None
+            }
+            
+            return content, usage
         
         except Exception as e:
             logger.error(f"Error generating response: {e}")
-            return f"Error: {str(e)}"
+            return f"Error: {str(e)}", {'prompt_tokens': None, 'completion_tokens': None, 'total_tokens': None}
     
     def generate_reasoning(self, example: ReasoningExample) -> ReasoningExample:
         """Generate reasoning using base prompt strategy"""
         # Create base prompt
         base_prompt = self._create_base_prompt(example.input_text, example.task_instruction)
         
-        # Generate response
-        response = self._generate_response(base_prompt)
+        # Generate response with usage info
+        response, usage = self._generate_response(base_prompt)
         prediction = self._extract_prediction(response)
         
         # Check if correct
@@ -179,6 +195,9 @@ Reasoning:"""
         example.reasoning_trace = response
         example.prediction = prediction
         example.is_correct = is_correct
+        example.prompt_tokens = usage['prompt_tokens']
+        example.completion_tokens = usage['completion_tokens']
+        example.total_tokens = usage['total_tokens']
         
         return example
 

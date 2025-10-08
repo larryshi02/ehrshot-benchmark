@@ -104,6 +104,15 @@ def prepare_data(args) -> List[Dict[str, Any]]:
     task_dirs = [d for d in os.listdir(args.path_to_labels_dir) 
                  if os.path.isdir(os.path.join(args.path_to_labels_dir, d))]
     
+    # Filter for specific task if specified
+    if args.specific_task:
+        if args.specific_task in task_dirs:
+            task_dirs = [args.specific_task]
+            logger.info(f"Filtering for specific task: {args.specific_task}")
+        else:
+            logger.error(f"Task '{args.specific_task}' not found. Available tasks: {task_dirs}")
+            raise ValueError(f"Task '{args.specific_task}' not found in {args.path_to_labels_dir}")
+    
     logger.info(f"Found {len(task_dirs)} task directories: {task_dirs}")
     
     # Load and combine labels from all tasks
@@ -255,8 +264,7 @@ def generate_reasoning_traces(examples: List[Dict[str, Any]], args) -> List[Reas
     # Generate reasoning traces
     for i, example in enumerate(reasoning_examples):
         logger.info(f"Processing example {i+1}/{len(reasoning_examples)}")
-        reasoning = generator.generate_reasoning(example)
-        example.reasoning = reasoning
+        generator.generate_reasoning(example)
     
     logger.info("Reasoning trace generation complete!")
     return reasoning_examples
@@ -286,8 +294,10 @@ def parse_args():
                        help="Path to directory containing saved labels")
     parser.add_argument("--task_to_instructions", required=True,
                        help="Path to task to instructions file")
+    parser.add_argument("--specific_task", type=str, default=None,
+                       help="Optional: Filter to generate patients and predict only for this specific task")
     parser.add_argument("--num_samples", type=int,
-                       help="Limit number of patients to load from femr database")
+                       help="Limit number of samples (not patients) to generate")
     parser.add_argument("--num_threads", type=int, default=1,
                        help="Number of threads to use")
     parser.add_argument("--serialization_strategy", default="unique_then_list_visits_wo_allconds_w_values_4k",
@@ -303,7 +313,7 @@ def parse_args():
     
     # Reasoning generation arguments
     parser.add_argument("--max_examples", type=int, default=10,
-                       help="Maximum number of samples (not patients) to process for reasoning")
+                       help="Maximum number of example patients to extract from FEMR database")
     parser.add_argument("--output_file", required=True,
                        help="Path to output JSON file for reasoning traces")
     parser.add_argument("--temperature", type=float, default=0.7,
