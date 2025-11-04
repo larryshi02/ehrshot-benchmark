@@ -4,10 +4,10 @@
 # Computes AUROC and other performance metrics
 
 # Configuration
-DATASET_FILE="./data_gpt-4o/acute_mi_sft_dataset.json"
+DATASET_FILE="./data_gpt-4o/acute_mi_sft_dataset_revised.json"
 SPLITS_FILE="/home/lrshi/llm/ehrshot-benchmark/EHRSHOT_ASSETS/splits/person_id_map.csv"
-PEFT_MODEL_PATH="./qwen_sft_output_cleaned"
-OUTPUT_DIR="./evaluation_results"
+PEFT_MODEL_PATH="./qwen_sft_output"
+OUTPUT_DIR="./evaluation_results_vllm"
 BASE_MODEL="Qwen/Qwen2.5-7B-Instruct"
 
 echo "Starting SFT model evaluation on test dataset..."
@@ -34,17 +34,19 @@ fi
 # Create output directory
 mkdir -p $OUTPUT_DIR
 
-# Run evaluation (Fine-tuned vs Baseline comparison)
-echo "Evaluating fine-tuned model vs baseline on test dataset..."
+# Run evaluation with VLLM (Fine-tuned vs Baseline comparison)
+echo "Evaluating fine-tuned model vs baseline on test dataset using VLLM..."
 python evaluate_sft_model.py \
     --base_model_name "$BASE_MODEL" \
     --peft_model_path "$PEFT_MODEL_PATH" \
     --dataset_file "$DATASET_FILE" \
     --path_to_splits "$SPLITS_FILE" \
     --output_dir "$OUTPUT_DIR" \
-    --max_length 32768 \
+    --max_model_len 32768 \
     --max_new_tokens 16384 \
     --temperature 0.1 \
+    --tensor_parallel_size 1 \
+    --gpu_memory_utilization 0.8 \
     --use_quantization \
     --save_predictions \
     --save_plots

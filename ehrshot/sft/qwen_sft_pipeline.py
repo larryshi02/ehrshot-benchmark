@@ -10,19 +10,23 @@ import argparse
 from typing import List, Dict, Optional, Any, Union
 from dataclasses import dataclass, field
 import torch
+from torch.nn.utils.rnn import pad_sequence
 from transformers import (
     AutoTokenizer, 
     AutoModelForCausalLM, 
     TrainingArguments, 
     Trainer,
     DataCollatorForLanguageModeling,
-    BitsAndBytesConfig
+    BitsAndBytesConfig,
+    TrainerCallback
 )
 from datasets import Dataset, DatasetDict
 from loguru import logger
 import numpy as np
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 import wandb
+import matplotlib.pyplot as plt
+from pathlib import Path
 
 
 @dataclass
@@ -88,42 +92,73 @@ class SFTDatasetProcessor:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
     
-    def format_conversation(self, conversation: List[Dict[str, str]]) -> str:
-        """Format conversation for Qwen model"""
-        formatted = ""
+    def format_conversation(self, conversation: List[Dict[str, str]]) -> tuple:
+        """Format conversation for Qwen model, returning user and assistant content separately"""
+        user_content = ""
+        assistant_content = ""
         
         for turn in conversation:
             role = turn["role"]
             content = turn["content"]
             
             if role == "user":
-                formatted += f"<|im_start|>user\n{content}<|im_end|>\n"
+                user_content += content
             elif role == "assistant":
-                formatted += f"<|im_start|>assistant\n{content}<|im_end|>\n"
+                assistant_content += content
         
-        return formatted
+        return user_content, assistant_content
     
     def tokenize_function(self, examples):
-        """Tokenize examples for training"""
-        # Format conversations
-        formatted_texts = []
+        """Tokenize examples for training, masking user content in loss"""
+        all_input_ids = []
+        all_labels = []
+        all_attention_mask = []
+        
         for conversation in examples["conversations"]:
-            formatted_text = self.format_conversation(conversation)
-            formatted_texts.append(formatted_text)
+            # Get user and assistant content separately
+            user_content, assistant_content = self.format_conversation(conversation)
+            
+            # Tokenize user content
+            user_tokens = self.tokenizer.encode(
+                user_content,
+                add_special_tokens=False,
+                truncation=False
+            )
+            
+            # Tokenize assistant content
+            assistant_tokens = self.tokenizer.encode(
+                assistant_content,
+                add_special_tokens=False,
+                truncation=False
+            )
+            
+            # Check total length and truncate if needed
+            total_length = len(user_tokens) + len(assistant_tokens)
+            if total_length > self.max_length:
+                # Truncate from the beginning if needed
+                if len(user_tokens) > self.max_length - len(assistant_tokens):
+                    user_tokens = user_tokens[-(self.max_length - len(assistant_tokens)):]
+                
+                # Also truncate assistant if still too long
+                if len(user_tokens) + len(assistant_tokens) > self.max_length:
+                    assistant_tokens = assistant_tokens[:self.max_length - len(user_tokens)]
+            
+            # Concatenate for input
+            input_ids = user_tokens + assistant_tokens
+            
+            # Create labels: -100 for user tokens (masked), actual token ids for assistant tokens
+            labels = [-100] * len(user_tokens) + assistant_tokens
+            attention_mask = [1] * len(input_ids)
+            
+            all_input_ids.append(input_ids)
+            all_labels.append(labels)
+            all_attention_mask.append(attention_mask)
         
-        # Tokenize
-        tokenized = self.tokenizer(
-            formatted_texts,
-            truncation=True,
-            padding=False,
-            max_length=self.max_length,
-            return_tensors=None,
-        )
-        
-        # For causal LM, labels are the same as input_ids
-        tokenized["labels"] = tokenized["input_ids"].copy()
-        
-        return tokenized
+        return {
+            "input_ids": all_input_ids,
+            "labels": all_labels,
+            "attention_mask": all_attention_mask
+        }
     
     def process_dataset(self, dataset: List[Dict]) -> Dataset:
         """Process dataset for training"""
@@ -149,6 +184,12 @@ class QwenSFTTrainer:
         self.tokenizer = None
         self.model = None
         self.trainer = None
+        
+        # Loss tracking
+        self.train_losses = []
+        self.eval_losses = []
+        self.train_steps = []
+        self.eval_steps = []
         
         # Set seed for reproducibility
         torch.manual_seed(config.seed)
@@ -310,11 +351,61 @@ class QwenSFTTrainer:
             gradient_checkpointing=False,
         )
         
-        # Use standard data collator for language modeling
-        data_collator = DataCollatorForLanguageModeling(
-            tokenizer=self.tokenizer,
-            mlm=False,
-        )
+        # Use custom data collator that preserves our masked labels
+        # We already have labels in the dataset (with -100 for masked tokens),
+        # so we just need a collator that batches them properly
+        class CustomDataCollator:
+            def __init__(self, tokenizer):
+                self.tokenizer = tokenizer
+            
+            def __call__(self, features):
+                batch = {}
+                
+                # Extract input_ids, labels, and attention_mask
+                input_ids = [torch.tensor(f["input_ids"]) for f in features]
+                labels = [torch.tensor(f["labels"]) for f in features]
+                attention_mask = [torch.tensor(f["attention_mask"]) for f in features]
+                
+                # Pad sequences
+                batch["input_ids"] = pad_sequence(
+                    input_ids, 
+                    batch_first=True, 
+                    padding_value=self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+                )
+                batch["labels"] = pad_sequence(
+                    labels, 
+                    batch_first=True, 
+                    padding_value=-100
+                )
+                batch["attention_mask"] = pad_sequence(
+                    attention_mask, 
+                    batch_first=True, 
+                    padding_value=0
+                )
+                
+                return batch
+        
+        data_collator = CustomDataCollator(self.tokenizer)
+        
+        # Loss tracking callback
+        class LossTrackingCallback(TrainerCallback):
+            def __init__(self, trainer_instance):
+                self.trainer_instance = trainer_instance
+            
+            def on_log(self, args, state, control, logs=None, **kwargs):
+                """Track losses during training and evaluation"""
+                if logs is not None:
+                    # Track training loss
+                    if "loss" in logs:
+                        self.trainer_instance.train_losses.append(logs["loss"])
+                        self.trainer_instance.train_steps.append(state.global_step)
+                        logger.info(f"Train loss at step {state.global_step}: {logs['loss']:.4f}")
+                    
+                    # Track evaluation loss
+                    if "eval_loss" in logs:
+                        self.trainer_instance.eval_losses.append(logs["eval_loss"])
+                        self.trainer_instance.eval_steps.append(state.global_step)
+                        logger.info(f"Eval loss at step {state.global_step}: {logs['eval_loss']:.4f}")
         
         # Custom trainer class to handle LoRA training
         class LoRATrainer(Trainer):
@@ -331,6 +422,9 @@ class QwenSFTTrainer:
                 
                 return (loss, outputs) if return_outputs else loss
         
+        # Create loss tracking callback
+        loss_callback = LossTrackingCallback(self)
+        
         # Initialize trainer
         self.trainer = LoRATrainer(
             model=self.model,
@@ -338,6 +432,7 @@ class QwenSFTTrainer:
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             data_collator=data_collator,
+            callbacks=[loss_callback],
         )
         
         logger.info("Trainer setup complete")
@@ -389,18 +484,19 @@ class QwenSFTTrainer:
         self.tokenizer.save_pretrained(self.config.output_dir)
         
         logger.info("Training completed!")
+        
+        # Plot losses
+        logger.info("Plotting loss curves...")
+        self.plot_losses()
     
     def generate_sample(self, prompt: str, max_new_tokens: int = 512) -> str:
         """Generate a sample response"""
         if self.model is None:
             raise ValueError("Model not loaded. Call load_model_and_tokenizer first.")
         
-        # Format prompt
-        formatted_prompt = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-        
         # Tokenize
         inputs = self.tokenizer(
-            formatted_prompt,
+            prompt,
             return_tensors="pt",
             truncation=True,
             max_length=self.config.max_length - max_new_tokens
@@ -421,11 +517,62 @@ class QwenSFTTrainer:
         # Decode
         response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
         
-        # Extract assistant response
-        if "<|im_start|>assistant" in response:
-            response = response.split("<|im_start|>assistant")[-1].strip()
-        
         return response
+    
+    def plot_losses(self):
+        """Plot training and evaluation losses"""
+        if not self.train_losses and not self.eval_losses:
+            logger.warning("No loss data to plot")
+            return
+        
+        # Create output directory for plots
+        output_path = Path(self.config.output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(12, 6))
+        
+        # Plot training loss
+        if self.train_losses:
+            ax.plot(self.train_steps, self.train_losses, 'b-', label='Train Loss', linewidth=2, alpha=0.8)
+        
+        # Plot evaluation loss
+        if self.eval_losses:
+            ax.plot(self.eval_steps, self.eval_losses, 'r-', label='Eval Loss', linewidth=2, alpha=0.8, marker='o', markersize=4)
+        
+        ax.set_xlabel('Training Step', fontsize=12)
+        ax.set_ylabel('Loss', fontsize=12)
+        ax.set_title('Training and Evaluation Loss', fontsize=14, fontweight='bold')
+        ax.legend(fontsize=11)
+        ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        # Save plot
+        plot_path = output_path / "loss_curves.png"
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        logger.info(f"Saved loss plot to {plot_path}")
+        
+        plt.close()
+        
+        # Print summary statistics
+        if self.train_losses:
+            final_train_loss = self.train_losses[-1]
+            initial_train_loss = self.train_losses[0] if len(self.train_losses) > 0 else None
+            logger.info(f"\nTrain Loss Summary:")
+            logger.info(f"  Initial: {initial_train_loss:.4f}")
+            logger.info(f"  Final: {final_train_loss:.4f}")
+            if initial_train_loss is not None:
+                logger.info(f"  Reduction: {initial_train_loss - final_train_loss:.4f} ({(1 - final_train_loss/initial_train_loss)*100:.1f}%)")
+        
+        if self.eval_losses:
+            final_eval_loss = self.eval_losses[-1]
+            initial_eval_loss = self.eval_losses[0] if len(self.eval_losses) > 0 else None
+            logger.info(f"\nEval Loss Summary:")
+            logger.info(f"  Initial: {initial_eval_loss:.4f}")
+            logger.info(f"  Final: {final_eval_loss:.4f}")
+            if initial_eval_loss is not None:
+                logger.info(f"  Reduction: {initial_eval_loss - final_eval_loss:.4f} ({(1 - final_eval_loss/initial_eval_loss)*100:.1f}%)")
 
 
 def parse_args():

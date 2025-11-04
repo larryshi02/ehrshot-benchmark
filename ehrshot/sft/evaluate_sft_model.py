@@ -5,48 +5,31 @@ Computes AUROC and other metrics for model performance evaluation.
 """
 
 import os
+import sys
 import json
 import argparse
-import pandas as pd
+# Import numpy first to avoid binary incompatibility issues
 import numpy as np
+import pandas as pd
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass
 import torch
-from transformers import (
-    AutoTokenizer, 
-    AutoModelForCausalLM,
-    BitsAndBytesConfig,
-    StoppingCriteria,
-    StoppingCriteriaList
-)
+import gc
+# Import sklearn before VLLM to avoid numpy issues
+from sklearn.metrics import roc_auc_score, precision_recall_curve, roc_curve
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 from loguru import logger
-from sklearn.metrics import roc_auc_score, precision_recall_curve, roc_curve
 import matplotlib.pyplot as plt
 import seaborn as sns
-
-
-class FinalAnswerStoppingCriteria(StoppingCriteria):
-    """Stop generation when 'Final Answer: [Positive/Negative]' is generated"""
-    
-    def __init__(self, tokenizer, stop_strings=["Final Answer: Positive", "Final Answer: Negative", "Final Answer:Positive", "Final Answer:Negative"]):
-        self.tokenizer = tokenizer
-        self.stop_strings = stop_strings
-        # Tokenize stop strings for efficient comparison
-        self.stop_token_ids = []
-        for stop_string in stop_strings:
-            tokens = tokenizer.encode(stop_string, add_special_tokens=False)
-            self.stop_token_ids.append(tokens)
-    
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-        # Check if any of the stop strings appear in the generated text
-        for stop_tokens in self.stop_token_ids:
-            if input_ids.shape[1] >= len(stop_tokens):
-                # Check if the last tokens match the stop string
-                last_tokens = input_ids[0, -len(stop_tokens):].tolist()
-                if last_tokens == stop_tokens:
-                    return True
-        return False
+# Import VLLM last to minimize numpy compatibility issues
+try:
+    from vllm import LLM, SamplingParams
+except ImportError as e:
+    print(f"ERROR: Failed to import VLLM: {e}")
+    print("Please ensure VLLM is installed: pip install vllm")
+    print("If you encounter numpy compatibility issues, try: pip install --upgrade numpy")
+    raise
 
 
 @dataclass
@@ -55,16 +38,19 @@ class EvaluationConfig:
     
     # Model configuration
     base_model_name: str = "Qwen/Qwen2.5-7B-Instruct"
-    peft_model_path: str = "./qwen_sft_output_cleaned"  # Use cleaned model when available
+    peft_model_path: str = "./qwen_sft_output"
     trust_remote_code: bool = True
-    use_quantization: bool = True
+    use_quantization: bool = False  # Disable quantization to avoid GPU detection issues
+    
+    # VLLM configuration
+    tensor_parallel_size: int = 1
+    gpu_memory_utilization: float = 0.8
+    max_model_len: int = 32768
     
     # Evaluation configuration
-    max_length: int = 16384
-    max_new_tokens: int = 8192
+    max_new_tokens: int = 16384
     temperature: float = 0.1  # Low temperature for more deterministic outputs
     top_p: float = 0.9
-    do_sample: bool = True
     
     # Output configuration
     output_dir: str = "./evaluation_results"
@@ -73,17 +59,93 @@ class EvaluationConfig:
 
 
 class SFTModelEvaluator:
-    """Evaluator for fine-tuned SFT model and baseline comparison"""
+    """Evaluator for fine-tuned SFT model and baseline comparison using VLLM"""
     
     def __init__(self, config: EvaluationConfig):
         self.config = config
         self.tokenizer = None
-        self.model = None
-        self.baseline_model = None
+        self.fine_tuned_llm = None
+        self.baseline_llm = None
+        self.vllm_kwargs: Optional[Dict[str, Any]] = None
+        
+    def _get_merged_model_path(self) -> str:
+        """Get or create path for merged model (adapter merged into base model)"""
+        # Create a cache directory for merged models
+        cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "ehrshot_merged_models")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Create a unique identifier from base model name and PEFT path
+        import hashlib
+        base_model_name_safe = self.config.base_model_name.replace("/", "_").replace("-", "_")
+        peft_path_abs = os.path.abspath(self.config.peft_model_path)
+        # Create a stable hash from the absolute path
+        peft_path_hash = hashlib.md5(peft_path_abs.encode()).hexdigest()[:8]
+        merged_model_name = f"{base_model_name_safe}_merged_{peft_path_hash}"
+        merged_model_path = os.path.join(cache_dir, merged_model_name)
+        
+        return merged_model_path
+    
+    def _merge_peft_adapter(self) -> str:
+        """Merge PEFT adapter with base model and return path to merged model"""
+        merged_model_path = self._get_merged_model_path()
+        
+        # Check if merged model already exists
+        if os.path.exists(merged_model_path) and os.path.exists(os.path.join(merged_model_path, "config.json")):
+            logger.info(f"Using existing merged model at: {merged_model_path}")
+            return merged_model_path
+        
+        # Check if PEFT model path exists
+        if not os.path.exists(self.config.peft_model_path):
+            logger.error(f"PEFT model path does not exist: {self.config.peft_model_path}")
+            raise FileNotFoundError(f"PEFT model path does not exist: {self.config.peft_model_path}")
+        
+        if not os.path.exists(os.path.join(self.config.peft_model_path, "adapter_config.json")):
+            logger.error(f"PEFT adapter config not found at: {self.config.peft_model_path}")
+            raise FileNotFoundError(f"PEFT adapter config not found at: {self.config.peft_model_path}")
+        
+        logger.info(f"Merging PEFT adapter from {self.config.peft_model_path} with base model {self.config.base_model_name}")
+        logger.info(f"This may take a few minutes...")
+        
+        # Load base model
+        logger.info(f"Loading base model: {self.config.base_model_name}")
+        base_model = AutoModelForCausalLM.from_pretrained(
+            self.config.base_model_name,
+            trust_remote_code=self.config.trust_remote_code,
+            torch_dtype=torch.float16,
+            device_map="auto"
+        )
+        
+        # Load PEFT adapter
+        logger.info(f"Loading PEFT adapter from: {self.config.peft_model_path}")
+        peft_model = PeftModel.from_pretrained(base_model, self.config.peft_model_path)
+        
+        # Merge adapter into base model
+        logger.info("Merging adapter into base model...")
+        merged_model = peft_model.merge_and_unload()
+        
+        # Save merged model
+        logger.info(f"Saving merged model to: {merged_model_path}")
+        os.makedirs(merged_model_path, exist_ok=True)
+        merged_model.save_pretrained(merged_model_path)
+        
+        # Also save tokenizer for consistency
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.config.base_model_name,
+            trust_remote_code=self.config.trust_remote_code
+        )
+        tokenizer.save_pretrained(merged_model_path)
+        
+        # Clean up memory
+        del base_model, peft_model, merged_model
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        logger.info(f"Merged model saved successfully to: {merged_model_path}")
+        return merged_model_path
         
     def load_model_and_tokenizer(self):
-        """Load the fine-tuned model and tokenizer"""
-        logger.info(f"Loading base model: {self.config.base_model_name}")
+        """Load the fine-tuned model and tokenizer using VLLM"""
+        logger.info(f"Loading tokenizer: {self.config.base_model_name}")
         
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -92,39 +154,77 @@ class SFTModelEvaluator:
             padding_side="right"
         )
         
-        # Load base model
-        model_kwargs = {
+        # Merge PEFT adapter with base model to create a merged model
+        merged_model_path = None
+        try:
+            merged_model_path = self._merge_peft_adapter()
+            logger.info(f"Using merged model for fine-tuned evaluation: {merged_model_path}")
+        except Exception as e:
+            logger.error(f"Failed to merge PEFT adapter: {e}")
+            logger.warning("Falling back to base model (fine-tuned weights will NOT be used)")
+            merged_model_path = None
+        
+        # VLLM configuration for fine-tuned model (with merged adapter if available)
+        fine_tuned_model_path = merged_model_path if merged_model_path else self.config.base_model_name
+        vllm_kwargs_fine_tuned = {
+            "model": fine_tuned_model_path,
             "trust_remote_code": self.config.trust_remote_code,
-            "torch_dtype": torch.float16,
-            "device_map": "auto"
+            "tensor_parallel_size": self.config.tensor_parallel_size,
+            "gpu_memory_utilization": self.config.gpu_memory_utilization,
+            "max_model_len": self.config.max_model_len,
+            "dtype": "float16",  # Explicitly set dtype to avoid GPU capability detection issues
         }
         
         # Add quantization if specified
         if self.config.use_quantization:
-            model_kwargs["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
-            )
+            vllm_kwargs_fine_tuned["quantization"] = "bitsandbytes"  # Use a supported quantization method
         
-        base_model = AutoModelForCausalLM.from_pretrained(
-            self.config.base_model_name,
-            **model_kwargs
-        )
+        # Load fine-tuned model (with merged adapter)
+        logger.info(f"Loading fine-tuned model with VLLM from: {fine_tuned_model_path}")
+        self.fine_tuned_llm = LLM(**vllm_kwargs_fine_tuned)
         
-        # Load PEFT model
-        logger.info(f"Loading PEFT model from: {self.config.peft_model_path}")
-        self.model = PeftModel.from_pretrained(base_model, self.config.peft_model_path)
+        # VLLM configuration for baseline model (always use base model)
+        vllm_kwargs_baseline = {
+            "model": self.config.base_model_name,
+            "trust_remote_code": self.config.trust_remote_code,
+            "tensor_parallel_size": self.config.tensor_parallel_size,
+            "gpu_memory_utilization": self.config.gpu_memory_utilization,
+            "max_model_len": self.config.max_model_len,
+            "dtype": "float16",
+        }
         
-        # Load baseline model for comparison
-        logger.info("Loading baseline model for comparison...")
-        self.baseline_model = AutoModelForCausalLM.from_pretrained(
-            self.config.base_model_name,
-            **model_kwargs
-        )
+        if self.config.use_quantization:
+            vllm_kwargs_baseline["quantization"] = "bitsandbytes"
         
-        logger.info("Models and tokenizer loaded successfully")
+        # Store baseline kwargs for later loading
+        self.vllm_kwargs = vllm_kwargs_baseline
+        
+        # Defer baseline model loading to avoid double GPU allocation
+        logger.info("Baseline VLLM model will be loaded after fine-tuned evaluation to conserve GPU memory")
+        
+        logger.info("VLLM models and tokenizer loaded successfully")
+
+    def _truncate_after_final_answer(self, text: str, extra_tokens: int = 5) -> str:
+        """Keep full prefix, then truncate AFTER first 'Final Answer' by extra_tokens.
+        If trigger not found or tokenization fails, return original text."""
+        if not isinstance(text, str):
+            return text
+        trigger = "Final Answer"
+        idx = text.find(trigger)
+        if idx < 0:
+            return text
+        prefix = text[:idx]  # everything before the trigger
+        suffix = text[idx:]  # include the trigger itself
+        try:
+            token_ids = self.tokenizer.encode(suffix, add_special_tokens=False)
+            # Keep first token(s) including trigger plus extra_tokens
+            keep = min(len(token_ids), 1 + extra_tokens)
+            truncated = self.tokenizer.decode(token_ids[:keep])
+            return (prefix + truncated).strip()
+        except Exception:
+            parts = suffix.split()
+            keep = min(len(parts), 2 + extra_tokens)
+            return (prefix + " " + " ".join(parts[:keep])).strip()
     
     def load_test_dataset(self, dataset_file: str, path_to_splits: str) -> List[Dict]:
         """Load test dataset from file and filter by test split"""
@@ -166,18 +266,25 @@ class SFTModelEvaluator:
         # Return as single completion prompt (no chat format)
         return user_content
     
-    def _get_stopping_criteria(self):
-        """Get stopping criteria for early stopping on 'Final Answer:'"""
-        stopping_criteria = FinalAnswerStoppingCriteria(self.tokenizer)
-        return StoppingCriteriaList([stopping_criteria])
+    def _get_sampling_params(self) -> SamplingParams:
+        """Get sampling parameters for VLLM generation"""
+        # Use VLLM's built-in stop parameters instead of custom stopping criteria
+        # Stop generation when "Final Answer" is detected
+        return SamplingParams(
+            temperature=self.config.temperature,
+            top_p=self.config.top_p,
+            max_tokens=self.config.max_new_tokens,
+            #stop=["Final Answer"],  # Stop when "Final Answer" is generated
+            repetition_penalty=1.1,
+        )
     
     def generate_prediction(self, example: Dict, use_baseline: bool = False) -> Dict:
-        """Generate prediction for a single example"""
+        """Generate prediction for a single example using VLLM"""
         prompt = self.format_prompt(example)
         
-        # Check if prompt is too long for our token budget
+        # Check prompt length
         prompt_tokens = self.tokenizer.encode(prompt, add_special_tokens=False)
-        max_prompt_tokens = self.config.max_length - self.config.max_new_tokens
+        max_prompt_tokens = self.config.max_model_len - self.config.max_new_tokens
         
         if len(prompt_tokens) > max_prompt_tokens:
             logger.warning(f"Skipping patient {example['patient_id']}: prompt too long ({len(prompt_tokens)} tokens > {max_prompt_tokens} limit)")
@@ -190,53 +297,26 @@ class SFTModelEvaluator:
             }
         
         # Choose model
-        model = self.baseline_model if use_baseline else self.model
+        llm = self.baseline_llm if use_baseline else self.fine_tuned_llm
         
-        # Tokenize
-        inputs = self.tokenizer(
-            prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.config.max_length - self.config.max_new_tokens
-        )
+        # Get sampling parameters
+        sampling_params = self._get_sampling_params()
         
-        # Ensure input_ids are integers and move to device
-        inputs = {k: v.to(model.device) if k == 'input_ids' else v.to(model.device) for k, v in inputs.items()}
-        if 'input_ids' in inputs:
-            inputs['input_ids'] = inputs['input_ids'].long()
-        
-        # Generate
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=self.config.max_new_tokens,
-                temperature=self.config.temperature,
-                top_p=self.config.top_p,
-                do_sample=self.config.do_sample,
-                pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                repetition_penalty=1.1,  # Reduce repetition
-                no_repeat_ngram_size=3,   # Prevent repeating 3-grams
-                early_stopping=True,      # Stop early when EOS is generated
-                stopping_criteria=self._get_stopping_criteria(),  # Custom stopping criteria
-            )
-        
-        # Decode response
-        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        # For single completion format, the response is the generated text after the prompt
-        # Remove the original prompt from the response
-        if prompt in response:
-            generated_text = response[len(prompt):].strip()
-        else:
-            logger.error(f"Prompt not found in response for patient {example['patient_id']}")
-            generated_text = response
+        # Generate using VLLM
+        try:
+            outputs = llm.generate([prompt], sampling_params)
+            generated_text = outputs[0].outputs[0].text.strip()
+            # Post-process to keep 'Final Answer' + next 5 tokens if present
+            generated_text = self._truncate_after_final_answer(generated_text, extra_tokens=5)
+        except Exception as e:
+            logger.error(f"Error generating for patient {example['patient_id']}: {e}")
+            generated_text = "Error in generation"
         
         # Clean up any remaining artifacts
         if generated_text.startswith("<|im_end|>"):
             generated_text = generated_text[len("<|im_end|>"):].strip()
         
-        # Fallback: If stopping criteria didn't work, complete the "Final Answer"
+        # Fallback: If stopping criteria didn't work properly, complete the "Final Answer"
         if generated_text.strip().endswith("Final Answer"):
             # Try to extract prediction from context
             if "positive" in generated_text.lower() or "acute myocardial infarction" in generated_text.lower():
@@ -246,9 +326,6 @@ class SFTModelEvaluator:
             else:
                 generated_text += ": [UNKNOWN]"
         
-        # Note: Stopping criteria should handle most cases, but fallback ensures completion
-        
-        
         return {
             'patient_id': example['patient_id'],
             'ground_truth': example.get('label_value', None),
@@ -256,6 +333,84 @@ class SFTModelEvaluator:
             'prompt': prompt,
             'model_type': 'baseline' if use_baseline else 'fine_tuned'
         }
+    
+    def generate_predictions_batch(self, examples: List[Dict], use_baseline: bool = False) -> List[Dict]:
+        """Generate predictions for a batch of examples using VLLM (faster)"""
+        prompts = []
+        valid_examples = []
+        
+        # Prepare prompts and filter valid examples
+        for example in examples:
+            prompt = self.format_prompt(example)
+            prompt_tokens = self.tokenizer.encode(prompt, add_special_tokens=False)
+            max_prompt_tokens = self.config.max_model_len - self.config.max_new_tokens
+            
+            if len(prompt_tokens) <= max_prompt_tokens:
+                prompts.append(prompt)
+                valid_examples.append(example)
+            else:
+                logger.warning(f"Skipping patient {example['patient_id']}: prompt too long")
+        
+        if not prompts:
+            return []
+        
+        # Choose model
+        llm = self.baseline_llm if use_baseline else self.fine_tuned_llm
+        
+        # Get sampling parameters
+        sampling_params = self._get_sampling_params()
+        
+        # Generate using VLLM batch processing
+        try:
+            outputs = llm.generate(prompts, sampling_params)
+            results = []
+            
+            for i, (output, example) in enumerate(zip(outputs, valid_examples)):
+                generated_text = output.outputs[0].text.strip()
+                # Post-process to keep 'Final Answer' + next 5 tokens if present
+                generated_text = self._truncate_after_final_answer(generated_text, extra_tokens=5)
+                
+                # Clean up any remaining artifacts
+                if generated_text.startswith("<|im_end|>"):
+                    generated_text = generated_text[len("<|im_end|>"):].strip()
+                
+                # Fallback: If stopping criteria didn't work properly, complete the "Final Answer"
+                if generated_text.strip().endswith("Final Answer"):
+                    if "positive" in generated_text.lower() or "acute myocardial infarction" in generated_text.lower():
+                        generated_text += ": Positive"
+                    elif "negative" in generated_text.lower() or "no evidence" in generated_text.lower():
+                        generated_text += ": Negative"
+                    else:
+                        generated_text += ": [UNKNOWN]"
+                
+                results.append({
+                    'patient_id': example['patient_id'],
+                    'ground_truth': example.get('label_value', None),
+                    'full_response': generated_text,
+                    'prompt': prompts[i],
+                    'model_type': 'baseline' if use_baseline else 'fine_tuned'
+                })
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error in batch generation: {e}")
+            # Fallback to individual generation
+            results = []
+            for example in valid_examples:
+                try:
+                    result = self.generate_prediction(example, use_baseline)
+                    results.append(result)
+                except Exception as e2:
+                    logger.error(f"Error generating for patient {example['patient_id']}: {e2}")
+                    results.append({
+                        'patient_id': example['patient_id'],
+                        'ground_truth': example.get('label_value', None),
+                        'full_response': "Error in generation",
+                        'prompt': self.format_prompt(example),
+                        'model_type': 'baseline' if use_baseline else 'fine_tuned'
+                    })
+            return results
     
     def extract_prediction_from_response(self, response: str) -> int:
         """Extract binary prediction from model response"""
@@ -296,9 +451,31 @@ class SFTModelEvaluator:
         fine_tuned_results = self._evaluate_single_model(test_dataset, use_baseline=False, output_file=fine_tuned_output_file)
         
         
-        # Evaluate baseline model
+        # Free fine-tuned engine to make room for baseline
+        try:
+            del self.fine_tuned_llm
+            self.fine_tuned_llm = None
+            torch.cuda.empty_cache()
+            gc.collect()
+        except Exception as e:
+            logger.warning(f"Could not fully free fine-tuned engine before loading baseline: {e}")
+        
+        # Load and evaluate baseline model
+        logger.info("Loading baseline VLLM model for comparison...")
+        if self.vllm_kwargs is None:
+            raise RuntimeError("VLLM kwargs missing; load_model_and_tokenizer must be called first")
+        self.baseline_llm = LLM(**self.vllm_kwargs)
         logger.info("Evaluating baseline model...")
         baseline_results = self._evaluate_single_model(test_dataset, use_baseline=True, output_file=baseline_output_file)
+        
+        # Optionally free baseline engine after evaluation
+        try:
+            del self.baseline_llm
+            self.baseline_llm = None
+            torch.cuda.empty_cache()
+            gc.collect()
+        except Exception as e:
+            logger.warning(f"Could not fully free baseline engine after evaluation: {e}")
         
 
   
@@ -326,75 +503,100 @@ class SFTModelEvaluator:
     
     def _evaluate_single_model(self, test_dataset: List[Dict], use_baseline: bool = False, 
                               output_file: str = None) -> Dict:
-        """Evaluate a single model on test dataset and incrementally save outputs"""
+        """Evaluate a single model on test dataset using VLLM batch processing"""
         model_name = "baseline" if use_baseline else "fine_tuned"
-        logger.info(f"Evaluating {model_name} model...")
+        logger.info(f"Evaluating {model_name} model with VLLM batch processing...")
         
+        # Process in batches for better performance
+        batch_size = 32  # Adjust based on GPU memory
+        all_results = []
+        
+        for i in range(0, len(test_dataset), batch_size):
+            batch = test_dataset[i:i + batch_size]
+            logger.info(f"Processing batch {i//batch_size + 1}/{(len(test_dataset) + batch_size - 1)//batch_size} ({len(batch)} examples)")
+            
+            try:
+                # Generate predictions for the batch
+                batch_results = self.generate_predictions_batch(batch, use_baseline=use_baseline)
+                all_results.extend(batch_results)
+                
+                # Process each result in the batch
+                for j, (result, example) in enumerate(zip(batch_results, batch)):
+                    # Extract prediction probability
+                    pred_prob = self.extract_prediction_from_response(result['full_response'])
+                    
+                    # Create output entry with cleaned reasoning
+                    output_entry = {
+                        'patient_id': example['patient_id'],
+                        'label_time': example.get('label_time', ''),
+                        'ground_truth': example.get('label_value', 0),
+                        'prediction': pred_prob,
+                        'prediction_text': "Positive" if pred_prob >= 0.5 else "Negative",
+                        'reasoning': result['full_response'],
+                        'model_type': model_name,
+                        'example_id': i + j + 1
+                    }
+                    
+                    # Incrementally save outputs
+                    if output_file:
+                        self._save_outputs_incremental([output_entry], output_file, is_first=(i == 0 and j == 0))
+                    
+                    logger.info(f"Patient {example['patient_id']}: GT={example.get('label_value', 0)}, Pred={pred_prob:.3f} ({model_name})")
+                
+            except Exception as e:
+                logger.error(f"Error processing batch {i//batch_size + 1}: {e}")
+                # Fallback to individual processing for this batch
+                for j, example in enumerate(batch):
+                    try:
+                        result = self.generate_prediction(example, use_baseline=use_baseline)
+                        pred_prob = self.extract_prediction_from_response(result['full_response'])
+                        
+                        output_entry = {
+                            'patient_id': example['patient_id'],
+                            'label_time': example.get('label_time', ''),
+                            'ground_truth': example.get('label_value', 0),
+                            'prediction': pred_prob,
+                            'prediction_text': "Positive" if pred_prob >= 0.5 else "Negative",
+                            'reasoning': result['full_response'],
+                            'model_type': model_name,
+                            'example_id': i + j + 1
+                        }
+                        
+                        if output_file:
+                            self._save_outputs_incremental([output_entry], output_file, is_first=(i == 0 and j == 0))
+                        
+                        all_results.append(result)
+                        
+                    except Exception as e2:
+                        logger.error(f"Error processing patient {example['patient_id']}: {e2}")
+                        # Create error entry
+                        output_entry = {
+                            'patient_id': example['patient_id'],
+                            'label_time': example.get('label_time', ''),
+                            'ground_truth': example.get('label_value', 0),
+                            'prediction': 0.5,
+                            'prediction_text': "Error",
+                            'reasoning': "Error in generation",
+                            'model_type': model_name,
+                            'example_id': i + j + 1,
+                            'error': str(e2)
+                        }
+                        
+                        if output_file:
+                            self._save_outputs_incremental([output_entry], output_file, is_first=(i == 0 and j == 0))
+        
+        # Extract data for metrics calculation
         predictions = []
         ground_truths = []
         patient_ids = []
         full_responses = []
-        all_outputs = []  # Store all outputs for incremental saving
         
-        for i, example in enumerate(test_dataset):
-            logger.info(f"Processing example {i+1}/{len(test_dataset)} (Patient {example['patient_id']}) - {model_name}")
-            
-            try:
-                # Generate prediction
-                result = self.generate_prediction(example, use_baseline=use_baseline)
-                
-                # Extract prediction probability
-                pred_prob = self.extract_prediction_from_response(result['full_response'])
-                
-                predictions.append(pred_prob)
-                ground_truths.append(example.get('label_value', 0))
-                patient_ids.append(example['patient_id'])
-                full_responses.append(result['full_response'])
-                
-                # Create output entry with cleaned reasoning
-                output_entry = {
-                    'patient_id': example['patient_id'],
-                    'label_time': example.get('label_time', ''),
-                    'ground_truth': example.get('label_value', 0),
-                    'prediction': pred_prob,
-                    'prediction_text': "Positive" if pred_prob >= 0.5 else "Negative",
-                    'reasoning': result['full_response'],  # This is now the cleaned assistant response
-                    'model_type': model_name,
-                    'example_id': i + 1
-                }
-                all_outputs.append(output_entry)
-                
-                # Incrementally save outputs
-                if output_file:
-                    self._save_outputs_incremental([output_entry], output_file, is_first=(i == 0))
-                
-                logger.info(f"Patient {example['patient_id']}: GT={example.get('label_value', 0)}, Pred={pred_prob:.3f} ({model_name})")
-                
-            except Exception as e:
-                logger.error(f"Error processing patient {example['patient_id']} with {model_name}: {e}")
-                # Use default values for failed predictions
-                predictions.append(0.5)
-                ground_truths.append(example.get('label_value', 0))
-                patient_ids.append(example['patient_id'])
-                full_responses.append("Error in generation")
-                
-                # Create error output entry
-                output_entry = {
-                    'patient_id': example['patient_id'],
-                    'label_time': example.get('label_time', ''),
-                    'ground_truth': example.get('label_value', 0),
-                    'prediction': 0.5,
-                    'prediction_text': "Error",
-                    'reasoning': "Error in generation",
-                    'model_type': model_name,
-                    'example_id': i + 1,
-                    'error': str(e)
-                }
-                all_outputs.append(output_entry)
-                
-                # Incrementally save outputs
-                if output_file:
-                    self._save_outputs_incremental([output_entry], output_file, is_first=(i == 0))
+        for result in all_results:
+            pred_prob = self.extract_prediction_from_response(result['full_response'])
+            predictions.append(pred_prob)
+            ground_truths.append(result['ground_truth'])
+            patient_ids.append(result['patient_id'])
+            full_responses.append(result['full_response'])
         
         # Convert to numpy arrays
         predictions = np.array(predictions)
@@ -434,7 +636,7 @@ class SFTModelEvaluator:
             'ground_truths': ground_truths.tolist(),
             'patient_ids': patient_ids,
             'full_responses': full_responses,
-            'all_outputs': all_outputs
+            'all_outputs': all_results
         }
         
         logger.info(f"{model_name.capitalize()} Results:")
@@ -617,7 +819,7 @@ def parse_args():
                        help="Base model name")
     parser.add_argument("--peft_model_path", type=str, default="./qwen_sft_output",
                        help="Path to fine-tuned PEFT model")
-    parser.add_argument("--use_quantization", action="store_true", default=True,
+    parser.add_argument("--use_quantization", action="store_true", default=False,
                        help="Use quantization")
     
     # Data configuration
@@ -626,9 +828,15 @@ def parse_args():
     parser.add_argument("--path_to_splits", type=str, required=True,
                        help="Path to splits CSV file")
     
+    # VLLM configuration
+    parser.add_argument("--tensor_parallel_size", type=int, default=1,
+                       help="Number of GPUs for tensor parallelism")
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.8,
+                       help="GPU memory utilization")
+    parser.add_argument("--max_model_len", type=int, default=16384,
+                       help="Maximum model length")
+    
     # Evaluation configuration
-    parser.add_argument("--max_length", type=int, default=4096,
-                       help="Maximum sequence length")
     parser.add_argument("--max_new_tokens", type=int, default=512,
                        help="Maximum new tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.1,
@@ -648,24 +856,47 @@ def parse_args():
 def main():
     args = parse_args()
     
-    # Create configuration
-    config = EvaluationConfig(
-        base_model_name=args.base_model_name,
-        peft_model_path=args.peft_model_path,
-        use_quantization=args.use_quantization,
-        max_length=args.max_length,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        output_dir=args.output_dir,
-        save_predictions=args.save_predictions,
-        save_plots=args.save_plots
-    )
-    
-    # Initialize evaluator
-    evaluator = SFTModelEvaluator(config)
-    
-    # Load model
-    evaluator.load_model_and_tokenizer()
+    try:
+        # Create configuration
+        config = EvaluationConfig(
+            base_model_name=args.base_model_name,
+            peft_model_path=args.peft_model_path,
+            use_quantization=args.use_quantization,
+            tensor_parallel_size=args.tensor_parallel_size,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_model_len=args.max_model_len,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            output_dir=args.output_dir,
+            save_predictions=args.save_predictions,
+            save_plots=args.save_plots
+        )
+        
+        # Initialize evaluator
+        evaluator = SFTModelEvaluator(config)
+        
+        # Load model
+        evaluator.load_model_and_tokenizer()
+    except ValueError as e:
+        if "numpy.dtype size changed" in str(e) or "binary incompatibility" in str(e).lower():
+            print("\n" + "=" * 70)
+            print("ERROR: Numpy compatibility issue detected!")
+            print("=" * 70)
+            print("\nThis is a common issue with VLLM and numpy version mismatches.")
+            print("\nTo fix this, run one of the following:")
+            print("\n  Option 1 (Quick fix):")
+            print("    python fix_numpy_import.py")
+            print("\n  Option 2 (Manual fix):")
+            print("    pip install --upgrade --force-reinstall numpy")
+            print("    pip install --upgrade --force-reinstall vllm scikit-learn pandas")
+            print("\n  Option 3 (Fresh environment - recommended):")
+            print("    python -m venv venv")
+            print("    source venv/bin/activate  # On Windows: venv\\Scripts\\activate")
+            print("    pip install numpy==1.24.3")
+            print("    pip install -r requirements_vllm.txt")
+            print("\n" + "=" * 70 + "\n")
+            sys.exit(1)
+        raise
     
     # Load test dataset
     test_dataset = evaluator.load_test_dataset(args.dataset_file, args.path_to_splits)
@@ -685,3 +916,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
