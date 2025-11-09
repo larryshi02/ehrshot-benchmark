@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
 """
-Multi-task evaluation pipeline for base Qwen3-8B model on 4 tasks:
+Multi-task evaluation pipeline for the finetuned Qwen model on 4 tasks:
 - Acute MI (new_acutemi)
 - Hyperlipidemia (new_hyperlipidemia)
 - Hypertension (new_hypertension)
 - Pancreatic Cancer (new_pancan)
 
-Uses VLLM for inference with 10 samples per patient and KV caching.
+Identical to the base-model evaluator except the default checkpoint points to
+`qwen_sft_output`.
 """
 
 import os
 import fcntl
+os.environ["VLLM_MP_START_METHOD"] = "spawn"
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"   # older key
+os.environ["VLLM_ENABLE_MP"] = "1"
+
+# While debugging, avoid FlashAttention probing (removes that CUDA call path)
+os.environ["VLLM_ATTENTION_BACKEND"] = "TORCH_SDPA"
 import sys
 import json
 import argparse
+import hashlib
+import multiprocessing as mp
 # Import numpy first to avoid binary incompatibility issues
 import numpy as np
 import pandas as pd
@@ -22,21 +31,35 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from collections import Counter
 import torch
+import torch.multiprocessing as torch_mp
 import gc
 # Import sklearn before VLLM to avoid numpy issues
 from sklearn.metrics import roc_auc_score, precision_recall_curve, roc_curve, precision_score, recall_score, f1_score
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel
 from loguru import logger
 
+# Force Python and torch multiprocessing to use spawn start method before any CUDA init
+try:
+    mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    pass
+try:
+    torch_mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    pass
 
+
+# Import VLLM last to minimize numpy compatibility issues
 try:
     from vllm import LLM, SamplingParams
-except ImportError as e:
-    print(f"ERROR: Failed to import VLLM: {e}")
+except ImportError as exc:
+    print(f"ERROR: Failed to import VLLM: {exc}")
     print("Please ensure VLLM is installed: pip install vllm")
     print("If you encounter numpy compatibility issues, try: pip install --upgrade numpy")
     raise
 
+# Task name mappings
 TASK_MAPPINGS = {
     'acute_mi': 'new_acutemi',
     'hyperlipidemia': 'new_hyperlipidemia',
@@ -44,6 +67,7 @@ TASK_MAPPINGS = {
     'pancreatic_cancer': 'new_pancan'
 }
 
+# Task-specific queries for prompt formatting
 TASK_QUERIES = {
     'acute_mi': 'will the patient develop an acute myocardial infarction in the next year',
     'hyperlipidemia': 'will the patient develop hyperlipidemia in the next year',
@@ -56,6 +80,10 @@ TASK_QUERIES = {
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
+
+FINETUNED_MODEL_DEFAULT = os.path.join(os.path.dirname(__file__), "qwen_sft_output")
+CACHE_MERGED_MODELS_DIR = os.path.join(os.path.expanduser("~"), ".cache", "ehrshot_merged_models")
+os.makedirs(CACHE_MERGED_MODELS_DIR, exist_ok=True)
 
 
 @contextmanager
@@ -71,12 +99,73 @@ def _exclusive_file_lock(target_file: str):
         os.close(fd)
 
 
+def _maybe_merge_peft_adapter(model_path: str) -> str:
+    """
+    If `model_path` points to a PEFT adapter directory, merge it with its base model
+    (following the approach used in evaluate_sft_model.py) and return the merged model path.
+    Otherwise, return the original path.
+    """
+    if not (model_path and os.path.isdir(model_path)):
+        return model_path
+
+    adapter_config_path = os.path.join(model_path, "adapter_config.json")
+    if not os.path.exists(adapter_config_path):
+        return model_path
+
+    logger.info(f"Detected PEFT adapter at {model_path}. Merging with base model for VLLM.")
+
+    with open(adapter_config_path, "r") as f:
+        adapter_cfg = json.load(f)
+
+    base_model_name = adapter_cfg.get("base_model_name_or_path")
+    if not base_model_name:
+        raise ValueError(
+            f"PEFT adapter at {model_path} missing 'base_model_name_or_path' in adapter_config.json"
+        )
+
+    abs_model_path = os.path.abspath(model_path)
+    cache_key = hashlib.md5(abs_model_path.encode("utf-8")).hexdigest()[:8]
+    base_safe = base_model_name.replace("/", "_").replace("-", "_")
+    merged_dir = os.path.join(CACHE_MERGED_MODELS_DIR, f"{base_safe}_merged_{cache_key}")
+
+    if os.path.exists(os.path.join(merged_dir, "config.json")):
+        logger.info(f"Using cached merged model at {merged_dir}")
+        return merged_dir
+
+    logger.info(f"Merging adapter into base model '{base_model_name}' -> {merged_dir}")
+
+    base_model = AutoModelForCausalLM.from_pretrained(
+        base_model_name,
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+        device_map="auto",
+    )
+    peft_model = PeftModel.from_pretrained(base_model, model_path)
+    merged_model = peft_model.merge_and_unload()
+
+    os.makedirs(merged_dir, exist_ok=True)
+    merged_model.save_pretrained(merged_dir)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        base_model_name,
+        trust_remote_code=True,
+    )
+    tokenizer.save_pretrained(merged_dir)
+
+    del base_model, peft_model, merged_model
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    logger.info(f"Merged model saved to {merged_dir}")
+    return merged_dir
+
+
 @dataclass
 class MultiTaskEvaluationConfig:
     """Configuration for multi-task model evaluation"""
     
     # Model configuration
-    base_model_name: str = "Qwen/Qwen3-8B"  # Use Qwen3-8B as specified
+    base_model_name: str = FINETUNED_MODEL_DEFAULT
     trust_remote_code: bool = True
     use_quantization: bool = False
     
@@ -139,6 +228,8 @@ class MultiTaskBaseModelEvaluator:
         self.llm = LLM(**vllm_kwargs)
         
         logger.info("VLLM model and tokenizer loaded successfully")
+        
+    
     def load_pre_serialized_data(self, task_name: str) -> List[Dict]:
         """Load pre-serialized EHR data from JSON file for a specific task"""
         # Map task name to JSON file
@@ -178,7 +269,9 @@ User: You are a helpful medical assistant. Below is a patient's electronic healt
             max_tokens=self.config.max_new_tokens,
             repetition_penalty=1.1,
             n=num_samples,
-            stop=["<STOP>"]
+            stop=["<STOP>"],
+
+            
         )
     
     def generate_multiple_predictions(self, prompt: str, num_samples: int) -> List[str]:
@@ -346,9 +439,26 @@ User: You are a helpful medical assistant. Below is a patient's electronic healt
             batch_results = self.generate_predictions_batch(batch, self.config.num_samples)
             
             # Process results and save incrementally
+            # Collect all responses for batch processing
+            all_batch_responses = []
+            responses_per_result = []  # Track how many responses per result
+            
             for result in batch_results:
                 responses = result['responses']
-                predictions_with_none = [self._extract_with_regex(r) for r in responses]
+                responses_per_result.append(len(responses))
+                all_batch_responses.extend(responses)
+            
+            # Extract predictions directly via regex (no parser LLM)
+            all_predictions_with_none = [self._extract_with_regex(r) for r in all_batch_responses]
+            all_parser_outputs = [""] * len(all_batch_responses)
+            
+            # Group predictions back by patient
+            response_idx = 0
+            for i, result in enumerate(batch_results):
+                num_responses = responses_per_result[i]
+                predictions_with_none = all_predictions_with_none[response_idx:response_idx + num_responses]
+                parser_outputs = all_parser_outputs[response_idx:response_idx + num_responses]
+                response_idx += num_responses
                 
                 predictions = [p for p in predictions_with_none if p is not None]
                 
@@ -368,9 +478,10 @@ User: You are a helpful medical assistant. Below is a patient's electronic healt
                 label_time = result.get('label_time')
                 original_prompt = result.get('prompt')
                 
-                # Get a sample response for logging purposes
+                # Get sample response and corresponding parser output
                 sample_idx = np.random.randint(0, len(responses)) if responses else 0
                 sample_response = responses[sample_idx] if responses else ""
+                sample_parser_output = parser_outputs[sample_idx] if parser_outputs else ""
                 
                 # Save this patient's results incrementally
                 patient_output = {
@@ -380,11 +491,13 @@ User: You are a helpful medical assistant. Below is a patient's electronic healt
                     'score': aggregated_pred,
                     'prompt': original_prompt,
                     'sample_response': sample_response,
+                    'sample_parser_output': sample_parser_output,
                     'num_samples': len(responses),
                     'num_valid_predictions': len(predictions),
                     'num_invalid_predictions': num_invalid,
                     'invalid_format_percentage': float(num_invalid / num_total * 100) if num_total > 0 else 0.0,
-                    'predictions': predictions
+                    'predictions': predictions,
+                    'parser_outputs': parser_outputs  # Include all parser outputs for this patient
                 }
                 self._save_outputs_incremental([patient_output], incremental_output_file, is_first=is_first_write)
                 is_first_write = False
@@ -589,6 +702,7 @@ User: You are a helpful medical assistant. Below is a patient's electronic healt
                 else:
                     existing_df = pd.DataFrame(columns=summary_df.columns)
 
+                # Ensure column order aligns with new summary
                 for col in summary_df.columns:
                     if col not in existing_df.columns:
                         existing_df[col] = pd.NA
@@ -617,8 +731,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate base Qwen3-8B model on 4 tasks")
     
     # Model configuration
-    parser.add_argument("--base_model_name", type=str, default="Qwen/Qwen3-8B",
-                       help="Base model name")
+    parser.add_argument("--base_model_name", type=str, default=FINETUNED_MODEL_DEFAULT,
+                       help="Finetuned model path or identifier (default: qwen_sft_output)")
     parser.add_argument("--use_quantization", action="store_true", default=False,
                        help="Use quantization")
     
@@ -651,8 +765,9 @@ def parse_args():
     parser.add_argument("--num_samples", type=int, default=10,
                        help="Number of samples per patient")
     
+    # Parser LLM configuration (always enabled)
     # Output configuration
-    parser.add_argument("--output_dir", type=str, default="./base_model_multi_task_results",
+    parser.add_argument("--output_dir", type=str, default="./finetuned_multi_task_results",
                        help="Output directory for results")
     
     return parser.parse_args()
@@ -667,9 +782,15 @@ def main():
         logger.info(f"Set CUDA_VISIBLE_DEVICES={args.gpu_id}")
     
     try:
+        resolved_model_path = _maybe_merge_peft_adapter(args.base_model_name)
+        if resolved_model_path != args.base_model_name:
+            logger.info(f"Using merged finetuned model: {resolved_model_path}")
+        else:
+            logger.info(f"Using finetuned model path: {resolved_model_path}")
+
         # Create configuration
         config = MultiTaskEvaluationConfig(
-            base_model_name=args.base_model_name,
+            base_model_name=resolved_model_path,
             use_quantization=args.use_quantization,
             tensor_parallel_size=args.tensor_parallel_size,
             gpu_memory_utilization=args.gpu_memory_utilization,

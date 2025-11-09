@@ -1,5 +1,5 @@
 #!/bin/bash
-# Bash script to evaluate base Qwen3-8B model on 4 tasks:
+# Bash script to evaluate finetuned Qwen model on 4 tasks:
 # - Acute MI (new_acutemi)
 # - Hyperlipidemia (new_hyperlipidemia)
 # - Hypertension (new_hypertension)
@@ -12,9 +12,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Configuration
-BASE_MODEL="Qwen/Qwen3-8B"
+BASE_MODEL="${BASE_MODEL:-${SCRIPT_DIR}/qwen_sft_output}"
 SERIALIZED_DATA_DIR="${SERIALIZED_DATA_DIR:-${SCRIPT_DIR}/serialized_multi_task_data}"
-OUTPUT_DIR="${SCRIPT_DIR}/base_model_multi_task_results"
+OUTPUT_DIR="${SCRIPT_DIR}/finetuned_multi_task_results"
 
 # VLLM configuration
 # Note: Each process will use TENSOR_PARALLEL_SIZE=1 (one GPU per task)
@@ -31,7 +31,7 @@ NUM_SAMPLES=${NUM_SAMPLES:-10}
 USE_QUANTIZATION=${USE_QUANTIZATION:-false}
 
 echo "=========================================="
-echo "Multi-Task Base Model Evaluation"
+echo "Multi-Task Finetuned Model Evaluation"
 echo "=========================================="
 echo "Base Model: $BASE_MODEL"
 echo "Serialized Data: $SERIALIZED_DATA_DIR"
@@ -95,7 +95,7 @@ run_task_on_gpu() {
     
     echo "Starting task '$task_name' on GPU $gpu_id (log: $log_file)"
     
-    python "$SCRIPT_DIR/evaluate_base_model_multi_task.py" \
+    python "$SCRIPT_DIR/evaluate_finetuned_multi_task.py" \
         --base_model_name "$BASE_MODEL" \
         --path_to_serialized_data "$SERIALIZED_DATA_DIR" \
         --tensor_parallel_size "$TENSOR_PARALLEL_SIZE" \
