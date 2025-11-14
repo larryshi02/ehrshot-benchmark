@@ -40,22 +40,22 @@ class AzureBackwardsReasoningConfig:
             with open(config_file, "r") as f:
                 config = json.load(f)
             self.endpoint = endpoint or config.get(
-                "endpoint", "https://clinicalml-cloudbank-openai.openai.azure.com/"
+                "endpoint", "https://ehrshot.openai.azure.com/"
             )
             self.api_key = api_key or config.get("api_key", os.getenv("AZURE_OPENAI_API_KEY"))
             self.api_version = api_version or config.get("api_version", "2024-12-01-preview")
-            self.deployment = deployment or config.get("deployment", "gpt-4.1")
-            self.model = model or config.get("model", "gpt-4.1")
+            self.deployment = deployment or config.get("deployment", "gpt-5-mini")
+            self.model = model or config.get("model", "gpt-5-mini")
         else:
             self.endpoint = endpoint or os.getenv(
-                "AZURE_OPENAI_ENDPOINT", "https://clinicalml-cloudbank-openai.openai.azure.com/"
+                "AZURE_OPENAI_ENDPOINT", "https://ehrshot.openai.azure.com/"
             )
             self.api_key = api_key or os.getenv("AZURE_OPENAI_API_KEY")
             self.api_version = api_version or os.getenv(
                 "AZURE_OPENAI_API_VERSION", "2024-12-01-preview"
             )
-            self.deployment = deployment or os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1")
-            self.model = model or os.getenv("AZURE_OPENAI_MODEL", "gpt-4.1")
+            self.deployment = deployment or os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5-mini")
+            self.model = model or os.getenv("AZURE_OPENAI_MODEL", "gpt-5-mini")
 
         if not self.api_key or self.api_key == "your-api-key-here":
             raise ValueError(
