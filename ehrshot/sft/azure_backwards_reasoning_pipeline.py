@@ -118,7 +118,7 @@ class AzureBackwardsReasoningGenerator:
         # Determine the correct answer format
         correct_answer = "Positive" if ground_truth == "Positive" else "Negative"
         
-        return f"""You are a medical expert tasked with explaining clinical reasoning. You have been given a patient's electronic healthcare record and the correct prediction outcome. Your task is to provide a detailed, step-by-step reasoning process that explains why this outcome is correct, WITHOUT explicitly stating that you know the answer in advance.
+        return f"""You are a medical expert tasked with explaining clinical reasoning. You have been given a patient's electronic healthcare record (EHR) in Markdown format and the correct prediction outcome. Your task is to provide a detailed, step-by-step reasoning process that explains why this outcome is correct, WITHOUT explicitly stating that you know the answer in advance.
 
 Focus on identifying the key clinical indicators, risk factors, and evidence from the patient's medical history that support the correct prediction. Structure your reasoning logically and provide specific examples from the patient data.
 
@@ -141,8 +141,9 @@ Reasoning:"""
     def _generate_response(self, prompt: str) -> tuple:
         """Generate response from Azure OpenAI and return content with usage info"""
         try:
-            response = self.client.chat.completions.create(
-                messages=[
+            # Build base parameters
+            completion_params = {
+                "messages": [
                     {
                         "role": "system",
                         "content": "You are a medical expert AI assistant that provides detailed clinical reasoning for medical predictions. You excel at analyzing patient data and explaining clinical decision-making processes.",
@@ -152,11 +153,16 @@ Reasoning:"""
                         "content": prompt,
                     }
                 ],
-                max_tokens=self.config.max_tokens,
-                temperature=self.config.temperature,
-                top_p=self.config.top_p,
-                model=self.config.deployment
-            )
+                "max_tokens": self.config.max_tokens,
+                "temperature": self.config.temperature,
+                "model": self.config.deployment
+            }
+            
+            # Only include top_p if the model supports it (some models like gpt-5-mini don't)
+            if "gpt-5" not in self.config.deployment.lower():
+                completion_params["top_p"] = self.config.top_p
+            
+            response = self.client.chat.completions.create(**completion_params)
             
             content = response.choices[0].message.content.strip()
             usage = {
