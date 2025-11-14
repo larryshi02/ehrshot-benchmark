@@ -76,25 +76,6 @@ launch_task() {
     local task_name=$(basename "$balanced_train_dataset_file" | sed 's/_balanced_sft_dataset.json//')
     local log_file="$OUTPUT_BASE_DIR/${task_name}_gpu${gpu_id}.log"
     
-    # Check if balanced dataset files exist
-    if [ ! -f "$balanced_train_dataset_file" ]; then
-        echo "Error: Balanced train dataset file not found: $balanced_train_dataset_file"
-        echo "Skipping task: $task_name"
-        return 1
-    fi
-    
-    if [ ! -f "$balanced_val_dataset_file" ]; then
-        echo "Error: Balanced val dataset file not found: $balanced_val_dataset_file"
-        echo "Skipping task: $task_name"
-        return 1
-    fi
-    
-    # Original dataset is optional (will use only balanced train if not provided)
-    if [ ! -f "$original_dataset_file" ]; then
-        echo "Warning: Original dataset file not found: $original_dataset_file"
-        echo "Will use only balanced train dataset for training"
-    fi
-    
     mkdir -p "$output_dir"
     
     (
@@ -168,10 +149,8 @@ run_batch() {
             "${balanced_val_datasets[$i]}" \
             "${output_dirs[$i]}" \
             "${gpu_ids[$i]}")
-        if [ $? -eq 0 ] && [ -n "$pid" ]; then
-            pids+=($pid)
-            echo "  Launched: $(basename "${balanced_train_datasets[$i]}") on GPU(s) ${gpu_ids[$i]} (PID: $pid)"
-        fi
+        pids+=($pid)
+        echo "  Launched: $(basename "${balanced_train_datasets[$i]}") on GPU(s) ${gpu_ids[$i]} (PID: $pid)"
     done
     
     if [ ${#pids[@]} -eq 0 ]; then
