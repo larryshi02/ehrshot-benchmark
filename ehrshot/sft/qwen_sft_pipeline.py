@@ -10,14 +10,11 @@ import argparse
 from typing import List, Dict, Optional, Any, Union
 from dataclasses import dataclass, field
 import torch
-from torch.nn.utils.rnn import pad_sequence
 from transformers import (
     AutoTokenizer, 
     AutoModelForCausalLM, 
     TrainingArguments, 
     Trainer,
-    DataCollatorForLanguageModeling,
-    BitsAndBytesConfig,
     TrainerCallback
 )
 from datasets import Dataset, DatasetDict
@@ -36,7 +33,7 @@ class SFTConfig:
     # Model configuration
     model_name: str = "Qwen/Qwen2.5-7B-Instruct"
     trust_remote_code: bool = True
-    use_quantization: bool = True
+    use_quantization: bool = False  # Disabled to match qwen3_sft_yesno.py
     quantization_config: Optional[Dict] = None
     
     # LoRA configuration
@@ -66,8 +63,8 @@ class SFTConfig:
     
     # Logging and evaluation
     logging_steps: int = 10
-    eval_steps: int = 100
-    save_steps: int = 500
+    eval_steps: int = 50
+    save_steps: int = 50  # Must equal eval_steps for load_best_model_at_end to work correctly
     evaluation_strategy: str = "steps"
     save_strategy: str = "steps"
     load_best_model_at_end: bool = True
@@ -207,36 +204,31 @@ class QwenSFTTrainer:
         """Load model and tokenizer"""
         logger.info(f"Loading model: {self.config.model_name}")
         
+        num_gpus = torch.cuda.device_count()
+        device_map = "balanced" if num_gpus > 1 else "auto"
+        logger.info(f"Using {num_gpus} GPU(s) with device_map={device_map}")
+        
         # Load tokenizer
+        # Use LEFT padding for decoder-only models during training
+        # This ensures proper alignment for causal language modeling
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.config.model_name,
             trust_remote_code=self.config.trust_remote_code,
-            padding_side="right"
+            padding_side="left"  # LEFT padding for causal LMs (decoder-only)
         )
         
-        # Load model
-        model_kwargs = {
-            "trust_remote_code": self.config.trust_remote_code,
-            "torch_dtype": torch.float16,
-            "device_map": "auto"
-        }
-        
-        # Add quantization config if specified
-        if self.config.use_quantization and self.config.quantization_config:
-            model_kwargs["quantization_config"] = BitsAndBytesConfig(**self.config.quantization_config)
-        elif self.config.use_quantization:
-            # Default quantization config
-            model_kwargs["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
-            )
-        
+        # Load model (no quantization to match qwen3_sft_yesno.py)
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.model_name,
-            **model_kwargs
+            trust_remote_code=self.config.trust_remote_code,
+            torch_dtype=torch.bfloat16,
+            device_map=device_map
         )
+        
+        # Enable gradient checkpointing to save memory during training
+        if hasattr(self.model, 'gradient_checkpointing_enable'):
+            self.model.gradient_checkpointing_enable()
+            logger.info("Gradient checkpointing enabled to save memory")
         
         # Apply LoRA if specified
         if self.config.use_lora:
@@ -274,40 +266,81 @@ class QwenSFTTrainer:
         logger.info("Model and tokenizer loaded successfully")
     
     def load_sft_dataset(self, dataset_file: str, split_ratio: float = 0.9, 
-                        path_to_splits: str = None, split_type: str = "train") -> DatasetDict:
-        """Load SFT dataset from file and filter by split"""
-        logger.info(f"Loading SFT dataset from {dataset_file}")
+                        path_to_splits: str = None, split_type: str = "train",
+                        original_dataset_file: Optional[str] = None,
+                        balanced_train_dataset_file: Optional[str] = None,
+                        balanced_val_dataset_file: Optional[str] = None) -> DatasetDict:
+        """
+        Load SFT dataset from file and filter by split.
         
-        with open(dataset_file, 'r') as f:
-            dataset = json.load(f)
+        If balanced datasets are provided:
+        - Concatenate original dataset with balanced train dataset for training
+        - Use balanced val dataset for evaluation (no 0.9/0.1 split)
         
-        logger.info(f"Loaded {len(dataset)} examples")
-        
-        # Filter by split if splits file is provided
-        if path_to_splits and os.path.exists(path_to_splits):
-            logger.info(f"Filtering dataset by {split_type} split from {path_to_splits}")
-            import pandas as pd
+        Otherwise, use the original behavior with split_ratio.
+        """
+        # Check if using balanced datasets
+        if balanced_train_dataset_file and balanced_val_dataset_file:
+            logger.info("Using balanced dataset mode: concatenating original + balanced train for training, balanced val for eval")
             
-            # Load splits
-            splits_df = pd.read_csv(path_to_splits)
-            split_patient_ids = set(splits_df[splits_df['split'] == split_type]['omop_person_id'].values)
+            # Load original dataset (if provided)
+            train_dataset = []
+            if original_dataset_file and os.path.exists(original_dataset_file):
+                logger.info(f"Loading original dataset from {original_dataset_file}")
+                with open(original_dataset_file, 'r') as f:
+                    original_data = json.load(f)
+                train_dataset.extend(original_data)
+                logger.info(f"Loaded {len(original_data)} examples from original dataset")
             
-            # Filter dataset to only include patients in the specified split
-            filtered_dataset = []
-            for example in dataset:
-                if 'patient_id' in example and example['patient_id'] in split_patient_ids:
-                    filtered_dataset.append(example)
+            # Load balanced train dataset
+            logger.info(f"Loading balanced train dataset from {balanced_train_dataset_file}")
+            with open(balanced_train_dataset_file, 'r') as f:
+                balanced_train_data = json.load(f)
+            train_dataset.extend(balanced_train_data)
+            logger.info(f"Loaded {len(balanced_train_data)} examples from balanced train dataset")
             
-            logger.info(f"Filtered from {len(dataset)} to {len(filtered_dataset)} examples for {split_type} split")
-            dataset = filtered_dataset
-        
-        # Split into train/eval
-        split_idx = int(len(dataset) * split_ratio)
-        train_dataset = dataset[:split_idx]
-        eval_dataset = dataset[split_idx:]
-        
-        logger.info(f"Train examples: {len(train_dataset)}")
-        logger.info(f"Eval examples: {len(eval_dataset)}")
+            logger.info(f"Total train examples after concatenation: {len(train_dataset)}")
+            
+            # Load balanced val dataset for eval
+            logger.info(f"Loading balanced val dataset from {balanced_val_dataset_file}")
+            with open(balanced_val_dataset_file, 'r') as f:
+                eval_dataset = json.load(f)
+            logger.info(f"Loaded {len(eval_dataset)} examples from balanced val dataset")
+            
+        else:
+            # Original behavior: load single dataset and split
+            logger.info(f"Loading SFT dataset from {dataset_file}")
+            
+            with open(dataset_file, 'r') as f:
+                dataset = json.load(f)
+            
+            logger.info(f"Loaded {len(dataset)} examples")
+            
+            # Filter by split if splits file is provided
+            if path_to_splits and os.path.exists(path_to_splits):
+                logger.info(f"Filtering dataset by {split_type} split from {path_to_splits}")
+                import pandas as pd
+                
+                # Load splits
+                splits_df = pd.read_csv(path_to_splits)
+                split_patient_ids = set(splits_df[splits_df['split'] == split_type]['omop_person_id'].values)
+                
+                # Filter dataset to only include patients in the specified split
+                filtered_dataset = []
+                for example in dataset:
+                    if 'patient_id' in example and example['patient_id'] in split_patient_ids:
+                        filtered_dataset.append(example)
+                
+                logger.info(f"Filtered from {len(dataset)} to {len(filtered_dataset)} examples for {split_type} split")
+                dataset = filtered_dataset
+            
+            # Split into train/eval
+            split_idx = int(len(dataset) * split_ratio)
+            train_dataset = dataset[:split_idx]
+            eval_dataset = dataset[split_idx:]
+            
+            logger.info(f"Train examples: {len(train_dataset)}")
+            logger.info(f"Eval examples: {len(eval_dataset)}")
         
         # Process datasets
         processor = SFTDatasetProcessor(self.tokenizer, self.config.max_length)
@@ -338,50 +371,67 @@ class QwenSFTTrainer:
             logging_steps=self.config.logging_steps,
             eval_steps=self.config.eval_steps,
             save_steps=self.config.save_steps,
-            evaluation_strategy=self.config.evaluation_strategy,
+            eval_strategy=self.config.evaluation_strategy,
             save_strategy=self.config.save_strategy,
             load_best_model_at_end=self.config.load_best_model_at_end,
             metric_for_best_model=self.config.metric_for_best_model,
             seed=self.config.seed,
             dataloader_num_workers=self.config.dataloader_num_workers,
             remove_unused_columns=self.config.remove_unused_columns,
-            report_to="wandb" if self.config.use_wandb else None,
+            report_to="wandb" if self.config.use_wandb else [],
             save_total_limit=3,
-            fp16=True,
-            gradient_checkpointing=False,
+            bf16=True,  # Use bfloat16 instead of fp16 to match qwen3_sft_yesno.py
+            dataloader_pin_memory=False,  # Disable pin memory to save GPU memory
         )
         
-        # Use custom data collator that preserves our masked labels
-        # We already have labels in the dataset (with -100 for masked tokens),
-        # so we just need a collator that batches them properly
+        # Use custom data collator with LEFT padding for decoder-only models
+        # Since pad_sequence pads to the right, we use manual left padding
         class CustomDataCollator:
             def __init__(self, tokenizer):
                 self.tokenizer = tokenizer
+                self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
             
             def __call__(self, features):
                 batch = {}
                 
                 # Extract input_ids, labels, and attention_mask
-                input_ids = [torch.tensor(f["input_ids"]) for f in features]
-                labels = [torch.tensor(f["labels"]) for f in features]
-                attention_mask = [torch.tensor(f["attention_mask"]) for f in features]
+                input_ids = [torch.tensor(f["input_ids"], dtype=torch.long) for f in features]
+                labels = [torch.tensor(f["labels"], dtype=torch.long) for f in features]
+                attention_mask = [torch.tensor(f["attention_mask"], dtype=torch.long) for f in features]
                 
-                # Pad sequences
-                batch["input_ids"] = pad_sequence(
-                    input_ids, 
-                    batch_first=True, 
-                    padding_value=self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-                )
-                batch["labels"] = pad_sequence(
-                    labels, 
-                    batch_first=True, 
-                    padding_value=-100
-                )
-                batch["attention_mask"] = pad_sequence(
-                    attention_mask, 
-                    batch_first=True, 
-                    padding_value=0
-                )
+                # Find max length
+                max_len = max(len(ids) for ids in input_ids)
+                
+                # Left pad sequences: pad on the left by prepending pad tokens
+                input_ids_padded = []
+                labels_padded = []
+                attention_mask_padded = []
+                
+                for ids, lbl, mask in zip(input_ids, labels, attention_mask):
+                    pad_len = max_len - len(ids)
+                    
+                    # Prepend padding (left padding)
+                    ids_padded = torch.cat([
+                        torch.full((pad_len,), self.pad_token_id, dtype=torch.long),
+                        ids
+                    ])
+                    lbl_padded = torch.cat([
+                        torch.full((pad_len,), -100, dtype=torch.long),
+                        lbl
+                    ])
+                    mask_padded = torch.cat([
+                        torch.zeros(pad_len, dtype=torch.long),
+                        mask
+                    ])
+                    
+                    input_ids_padded.append(ids_padded)
+                    labels_padded.append(lbl_padded)
+                    attention_mask_padded.append(mask_padded)
+                
+                # Stack into batch tensors
+                batch["input_ids"] = torch.stack(input_ids_padded)
+                batch["labels"] = torch.stack(labels_padded)
+                batch["attention_mask"] = torch.stack(attention_mask_padded)
                 
                 return batch
         
@@ -409,7 +459,11 @@ class QwenSFTTrainer:
         
         # Custom trainer class to handle LoRA training
         class LoRATrainer(Trainer):
-            def compute_loss(self, model, inputs, return_outputs=False):
+            def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+                # Hugging Face Trainer (>=0.45) may pass extra kwargs (e.g., num_items_in_batch)
+                # that we don't need. Ignore them to stay compatible across versions.
+                kwargs.pop("num_items_in_batch", None)
+                
                 """Custom loss computation for LoRA training"""
                 labels = inputs.get("labels")
                 outputs = model(**inputs)
@@ -583,18 +637,26 @@ def parse_args():
                        help="Model name or path")
     parser.add_argument("--output_dir", type=str, default="./qwen_sft_output",
                        help="Output directory for trained model")
-    parser.add_argument("--use_quantization", action="store_true", default=True,
-                       help="Use quantization")
+    parser.add_argument("--use_quantization", action="store_true", default=False,
+                       help="Use quantization (disabled by default to match qwen3_sft_yesno.py)")
     parser.add_argument("--use_lora", action="store_true", default=True,
                        help="Use LoRA for efficient fine-tuning")
     
     # Training configuration
-    parser.add_argument("--dataset_file", type=str, required=True,
-                       help="Path to SFT dataset JSON file")
+    parser.add_argument("--dataset_file", type=str, default=None,
+                       help="Path to SFT dataset JSON file (required if not using balanced datasets)")
     parser.add_argument("--path_to_splits", type=str, default=None,
                        help="Path to splits CSV file")
     parser.add_argument("--split_type", type=str, default="train", choices=["train", "val", "test"],
                        help="Which split to use (train, val, test)")
+    
+    # Balanced dataset configuration
+    parser.add_argument("--original_dataset_file", type=str, default=None,
+                       help="Path to original SFT dataset JSON file (for balanced mode)")
+    parser.add_argument("--balanced_train_dataset_file", type=str, default=None,
+                       help="Path to balanced train SFT dataset JSON file (for balanced mode)")
+    parser.add_argument("--balanced_val_dataset_file", type=str, default=None,
+                       help="Path to balanced val SFT dataset JSON file (for balanced mode)")
     parser.add_argument("--num_train_epochs", type=int, default=3,
                        help="Number of training epochs")
     parser.add_argument("--per_device_train_batch_size", type=int, default=1,
@@ -617,6 +679,8 @@ def parse_args():
     # Other
     parser.add_argument("--use_wandb", action="store_true",
                        help="Use Weights & Biases for logging")
+    parser.add_argument("--gpu_id", type=str, default=None,
+                       help="GPU ID(s) to use (sets CUDA_VISIBLE_DEVICES)")
     parser.add_argument("--seed", type=int, default=42,
                        help="Random seed")
     
@@ -625,6 +689,18 @@ def parse_args():
 
 def main():
     args = parse_args()
+    
+    # Validate arguments
+    if not args.balanced_train_dataset_file and not args.dataset_file:
+        raise ValueError("Either --dataset_file or --balanced_train_dataset_file must be provided")
+    
+    if args.balanced_train_dataset_file and not args.balanced_val_dataset_file:
+        raise ValueError("--balanced_val_dataset_file is required when using --balanced_train_dataset_file")
+    
+    # Set GPU
+    if args.gpu_id is not None:
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
+        logger.info(f"Set CUDA_VISIBLE_DEVICES={args.gpu_id}")
     
     # Create configuration
     config = SFTConfig(
@@ -650,8 +726,22 @@ def main():
     # Load model and tokenizer
     trainer.load_model_and_tokenizer()
     
-    # Load dataset
-    datasets = trainer.load_sft_dataset(args.dataset_file, path_to_splits=args.path_to_splits, split_type=args.split_type)
+    # Load dataset (use balanced mode if balanced datasets are provided)
+    if args.balanced_train_dataset_file:
+        logger.info("Using balanced dataset mode")
+        datasets = trainer.load_sft_dataset(
+            dataset_file=args.dataset_file or "",  # Not used in balanced mode, but required for signature
+            original_dataset_file=args.original_dataset_file,
+            balanced_train_dataset_file=args.balanced_train_dataset_file,
+            balanced_val_dataset_file=args.balanced_val_dataset_file
+        )
+    else:
+        logger.info("Using standard dataset mode")
+        datasets = trainer.load_sft_dataset(
+            dataset_file=args.dataset_file,
+            path_to_splits=args.path_to_splits,
+            split_type=args.split_type
+        )
     
     # Setup trainer
     trainer.setup_trainer(datasets["train"], datasets["eval"])
