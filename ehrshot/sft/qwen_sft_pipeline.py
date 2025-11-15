@@ -31,10 +31,9 @@ class SFTConfig:
     """Configuration for supervised fine-tuning"""
     
     # Model configuration
-    model_name: str = "Qwen/Qwen2.5-7B-Instruct"
+    model_name: str = "Qwen/Qwen3-8B"
     trust_remote_code: bool = True
-    use_quantization: bool = False  # Disabled to match qwen3_sft_yesno.py
-    quantization_config: Optional[Dict] = None
+
     
     # LoRA configuration
     use_lora: bool = True
@@ -217,7 +216,6 @@ class QwenSFTTrainer:
             padding_side="left"  # LEFT padding for causal LMs (decoder-only)
         )
         
-        # Load model (no quantization to match qwen3_sft_yesno.py)
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.model_name,
             trust_remote_code=self.config.trust_remote_code,
@@ -633,12 +631,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Qwen Supervised Fine-Tuning Pipeline")
     
     # Model configuration
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct",
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-8B",
                        help="Model name or path")
     parser.add_argument("--output_dir", type=str, default="./qwen_sft_output",
                        help="Output directory for trained model")
-    parser.add_argument("--use_quantization", action="store_true", default=False,
-                       help="Use quantization (disabled by default to match qwen3_sft_yesno.py)")
     parser.add_argument("--use_lora", action="store_true", default=True,
                        help="Use LoRA for efficient fine-tuning")
     
@@ -706,7 +702,6 @@ def main():
     config = SFTConfig(
         model_name=args.model_name,
         output_dir=args.output_dir,
-        use_quantization=args.use_quantization,
         use_lora=args.use_lora,
         num_train_epochs=args.num_train_epochs,
         per_device_train_batch_size=args.per_device_train_batch_size,
