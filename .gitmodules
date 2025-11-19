@@ -1,0 +1,3 @@
+[submodule "ehrshot/sft/external/hrp"]
+	path = ehrshot/sft/external/hrp
+	url = https://github.com/clinicalml/ibc-hrp.git
