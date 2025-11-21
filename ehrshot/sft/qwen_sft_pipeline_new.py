@@ -19,7 +19,8 @@ from transformers import (
     AutoModelForCausalLM, 
     TrainingArguments, 
     Trainer,
-    DataCollatorForSeq2Seq
+    DataCollatorForSeq2Seq,
+    EarlyStoppingCallback
 )
 from peft import LoraConfig, get_peft_model, TaskType
 import wandb
@@ -37,7 +38,7 @@ class SFTConfig:
     
     # Hardware / Precision
     bf16: bool = True
-    attn_implementation: str = "flash_attention_2"
+    attn_implementation: str = "sdpa"  # Use PyTorch SDPA (flash_attention_2 requires CUDA toolkit)
     
     # Optimization (Total Batch Size = 2 * 4 * Num_GPUs = 8 per GPU effective)
     per_device_train_batch_size: int = 2
@@ -50,9 +51,13 @@ class SFTConfig:
     lr_scheduler_type: str = "cosine"
     gradient_checkpointing: bool = True
     
+    # Early Stopping
+    early_stopping_patience: int = 3  # Stop if no improvement for 3 evaluations
+    early_stopping_threshold: float = 0.0  # Minimum improvement required
+    
     # LoRA
     use_lora: bool = True
-    lora_r: int = 64
+    lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
     lora_target_modules: List[str] = field(default_factory=lambda: [
@@ -159,13 +164,19 @@ def load_model(config: SFTConfig) -> Any:
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
         trust_remote_code=True,
-        torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
+        dtype=torch.bfloat16 if config.bf16 else torch.float32,
         attn_implementation=config.attn_implementation,
         device_map="auto" # Will default to cuda:0 if single GPU visible
     )
     
     if config.use_lora:
         logger.info("Applying LoRA...")
+        # Enable gradient checkpointing before applying LoRA
+        if config.gradient_checkpointing:
+            model.gradient_checkpointing_enable()
+            # Enable input gradients for embeddings (required for gradient checkpointing)
+            model.enable_input_require_grads()
+        
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=config.lora_r,
@@ -202,6 +213,7 @@ def run_training(model, tokenizer, datasets, output_dir, config: SFTConfig):
         save_total_limit=3,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
+        greater_is_better=False,  # Lower eval_loss is better
         dataloader_num_workers=config.dataloader_num_workers,
         report_to="wandb",  # 
         run_name=f"{output_dir.split('/')[-1]}", 
@@ -216,12 +228,19 @@ def run_training(model, tokenizer, datasets, output_dir, config: SFTConfig):
         pad_to_multiple_of=8
     )
 
+    # Early stopping callback
+    early_stopping = EarlyStoppingCallback(
+        early_stopping_patience=config.early_stopping_patience,
+        early_stopping_threshold=config.early_stopping_threshold
+    )
+    
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=datasets["train"],
         eval_dataset=datasets["validation"],
-        data_collator=data_collator
+        data_collator=data_collator,
+        callbacks=[early_stopping]
     )
 
     logger.info("Starting Training...")
@@ -239,10 +258,23 @@ def main():
     parser.add_argument("--train_file", type=str, required=True, help="Path to training JSON")
     parser.add_argument("--eval_file", type=str, required=True, help="Path to validation JSON")
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-8B", help="Model name from HuggingFace")
+    parser.add_argument("--lora_rank", type=int, default=64, help="LoRA rank (alpha will be 2*rank)")
     args = parser.parse_args()
 
     # 1. Load Config (Defaults are defined in the class)
-    config = SFTConfig()
+    # Note: lora_alpha is automatically set to 2 * lora_rank
+    config = SFTConfig(
+        model_name=args.model_name,
+        lora_r=args.lora_rank,
+        lora_alpha=args.lora_rank * 2
+    )
+    
+    logger.info(f"Training Configuration:")
+    logger.info(f"  Model: {config.model_name}")
+    logger.info(f"  LoRA Rank: {config.lora_r}, Alpha: {config.lora_alpha}")
+    logger.info(f"  Batch Size: {config.per_device_train_batch_size}, Grad Accum: {config.gradient_accumulation_steps}")
+    logger.info(f"  Early Stopping: patience={config.early_stopping_patience}, threshold={config.early_stopping_threshold}")
     
     # Set Seed
     torch.manual_seed(config.seed)
