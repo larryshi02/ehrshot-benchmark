@@ -10,7 +10,7 @@ CONDA_ENV="${CONDA_ENV:-EHRSHOT_ENV}"
 # ============================================================
 
 # --- MODEL CONFIGURATION ---
-MODEL_NAME="Qwen/Qwen3-1.7B"
+MODEL_NAME="Qwen/Qwen3-8B"
 
 # --- LORA CONFIGURATION ---
 LORA_RANK=16
@@ -105,10 +105,6 @@ launch_task() {
         
         # Force this shell to only see one GPU
         export CUDA_VISIBLE_DEVICES=$gpu_id
-        # --- WANDB CONFIGURATION ---
-        export WANDB_PROJECT="$WANDB_PROJECT"
-        # Name the run based on the task
-        export WANDB_NAME="${task_name}"
         
         # Run python directly
         python "$SCRIPT_DIR/qwen_sft_pipeline_new.py" \
@@ -116,7 +112,9 @@ launch_task() {
             --eval_file "$eval_file" \
             --output_dir "$output_dir" \
             --model_name "$MODEL_NAME" \
-            --lora_rank "$LORA_RANK"
+            --lora_rank "$LORA_RANK" \
+            --wandb_project "$WANDB_PROJECT" \
+            --wandb_run_name "${task_name}"
     ) > "$log_file" 2>&1 &
 }
 

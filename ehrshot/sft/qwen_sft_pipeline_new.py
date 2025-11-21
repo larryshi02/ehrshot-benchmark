@@ -190,8 +190,15 @@ def load_model(config: SFTConfig) -> Any:
         
     return model
 
-def run_training(model, tokenizer, datasets, output_dir, config: SFTConfig):
+def run_training(model, tokenizer, datasets, output_dir, wandb_project: str, wandb_run_name: str, config: SFTConfig):
     """Sets up Trainer and starts training."""
+    
+    logger.info(f"WandB Project: {wandb_project}")
+    logger.info(f"WandB Run Name: {wandb_run_name}")
+    
+    # Set WandB project as environment variable (TrainingArguments doesn't have a project parameter)
+    # This ensures the project name from the argument is used
+    os.environ["WANDB_PROJECT"] = wandb_project
     
     training_args = TrainingArguments(
         output_dir=output_dir,
@@ -215,8 +222,8 @@ def run_training(model, tokenizer, datasets, output_dir, config: SFTConfig):
         metric_for_best_model="eval_loss",
         greater_is_better=False,  # Lower eval_loss is better
         dataloader_num_workers=config.dataloader_num_workers,
-        report_to="wandb",  # 
-        run_name=f"{output_dir.split('/')[-1]}", 
+        report_to="wandb",
+        run_name=wandb_run_name,
         remove_unused_columns=True,
         ddp_find_unused_parameters=False if config.use_lora else None,
     )
@@ -260,6 +267,8 @@ def main():
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-8B", help="Model name from HuggingFace")
     parser.add_argument("--lora_rank", type=int, default=64, help="LoRA rank (alpha will be 2*rank)")
+    parser.add_argument("--wandb_project", type=str, required=True, help="WandB project name")
+    parser.add_argument("--wandb_run_name", type=str, required=True, help="WandB run name")
     args = parser.parse_args()
 
     # 1. Load Config (Defaults are defined in the class)
@@ -292,7 +301,7 @@ def main():
         logger.error("⚠️  First training example has NO labels! Check dataset format.")
         
     # 5. Train
-    run_training(model, tokenizer, datasets, args.output_dir, config)
+    run_training(model, tokenizer, datasets, args.output_dir, args.wandb_project, args.wandb_run_name, config)
 
 if __name__ == "__main__":
     main()
