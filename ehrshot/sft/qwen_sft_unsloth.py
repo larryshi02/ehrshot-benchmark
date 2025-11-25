@@ -34,16 +34,16 @@ class SFTConfig:
     """
     # Model
     model_name: str = "Qwen/Qwen3-8B" # Will effectively load Qwen 2.5/3 via Unsloth
-    max_length: int = 11264
+    max_length: int = 10240
     
     # Hardware / Precision
     bf16: bool = True
     
     # Optimization (Total Batch Size = 2 * 4 * Num_GPUs = 8 per GPU effective)
     # A100 80GB with Unsloth has huge headroom, so we use Batch Size 8 directly.
-    per_device_train_batch_size: int = 8
+    per_device_train_batch_size: int = 12
     per_device_eval_batch_size: int = 1
-    gradient_accumulation_steps: int = 2
+    gradient_accumulation_steps: int = 1
     learning_rate: float = 1e-4
     num_train_epochs: int = 2
     weight_decay: float = 0.01
@@ -52,22 +52,25 @@ class SFTConfig:
     gradient_checkpointing: bool = False
     
     # Early Stopping
-    early_stopping_patience: int = 3 
+    early_stopping_patience: int = 10 
     early_stopping_threshold: float = 0.0 
     
     # LoRA
     use_lora: bool = True
     lora_r: int = 16
     lora_alpha: int = 32
-    lora_dropout: float = 0.1
+    lora_dropout: float = 0  # To maximize unsloth optimization
     lora_target_modules: List[str] = field(default_factory=lambda: [
         "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"
     ])
     
     # System
     seed: int = 42
-    dataloader_num_workers: int = 4
 
+    dataloader_num_workers: int = 2
+    dataloader_prefetch_factor: int = 1
+    dataloader_pin_memory: bool = True 
+    dataloader_persistent_workers: bool = True 
 
 # --- DATA PROCESSING FUNCTIONS ---
 
@@ -210,15 +213,18 @@ def run_training(model, tokenizer, datasets, output_dir, wandb_project: str, wan
         optim="adamw_torch_fused",
         gradient_checkpointing=config.gradient_checkpointing,
         logging_steps=10,
-        eval_steps=50,
-        save_steps=50,
+        eval_steps=100,
+        save_steps=100,
         eval_strategy="steps",
         save_strategy="steps",
-        save_total_limit=3,
+        save_total_limit=10,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         dataloader_num_workers=config.dataloader_num_workers,
+        dataloader_pin_memory=config.dataloader_pin_memory,
+        dataloader_persistent_workers=config.dataloader_persistent_workers,
+        dataloader_prefetch_factor=config.dataloader_prefetch_factor,
         report_to="wandb",
         run_name=wandb_run_name,
         remove_unused_columns=True,

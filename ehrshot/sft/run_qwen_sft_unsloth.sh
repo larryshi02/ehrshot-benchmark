@@ -2,6 +2,15 @@
 # SFT Training Pipeline - Parallel Execution
 # Runs 4 independent training tasks on GPUs 0, 1, 2, 3
 
+# Limit the main process (Matrix Math) to 8 threads
+export OMP_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+
+# Limit the data loader workers to 1 thread each (prevents explosion)
+export OPENBLAS_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONDA_ENV="${CONDA_ENV:-EHRSHOT_ENV}"
 PYTHON_SCRIPT="qwen_sft_unsloth.py"  # Name of your python script
@@ -17,59 +26,49 @@ MODEL_NAME="Qwen/Qwen3-8B"
 LORA_RANK=16
 
 # --- DATASET CONFIGURATION ---
-DATA_DIR="data_gpt-5-mini/sft_rt_unsupervised/"
+# Data is stored in /dev/shm/ehrshot-data for faster I/O
+DATA_DIR="/dev/shm/ehrshot-data/data_gpt-5-mini/sft_rt_yn/"
 
 # 1. Acute MI
-TASK1_TRAIN="${SCRIPT_DIR}/${DATA_DIR}train_all/acute_mi_sft_dataset.json"
-TASK1_VAL="${SCRIPT_DIR}/${DATA_DIR}val_small/acute_mi_sft_dataset.json"
+TASK1_TRAIN="${DATA_DIR}train_all/acute_mi_sft_dataset.json"
+TASK1_VAL="${DATA_DIR}val_small/acute_mi_sft_dataset.json"
 
 # 2. Pancreatic Cancer
-TASK2_TRAIN="${SCRIPT_DIR}/${DATA_DIR}train_all/pancreatic_cancer_sft_dataset.json"
-TASK2_VAL="${SCRIPT_DIR}/${DATA_DIR}val_small/pancreatic_cancer_sft_dataset.json"
+TASK2_TRAIN="${DATA_DIR}train_all/pancreatic_cancer_sft_dataset.json"
+TASK2_VAL="${DATA_DIR}val_small/pancreatic_cancer_sft_dataset.json"
 
 # 3. Hypertension
-TASK3_TRAIN="${SCRIPT_DIR}/${DATA_DIR}train_all/hypertension_sft_dataset.json"
-TASK3_VAL="${SCRIPT_DIR}/${DATA_DIR}val_small/hypertension_sft_dataset.json"
+TASK3_TRAIN="${DATA_DIR}train_all/hypertension_sft_dataset.json"
+TASK3_VAL="${DATA_DIR}val_small/hypertension_sft_dataset.json"
 
 # 4. Hyperlipidemia
-TASK4_TRAIN="${SCRIPT_DIR}/${DATA_DIR}train_all/hyperlipidemia_sft_dataset.json"
-TASK4_VAL="${SCRIPT_DIR}/${DATA_DIR}val_small/hyperlipidemia_sft_dataset.json"
+TASK4_TRAIN="${DATA_DIR}train_all/hyperlipidemia_sft_dataset.json"
+TASK4_VAL="${DATA_DIR}val_small/hyperlipidemia_sft_dataset.json"
 
 # ============================================================
 # END OF USER CONFIGURATION
 # ============================================================
 
-# --- OPTION A: RUN ALL (Comment this OUT for test) ---
-ALL_TRAIN=("$TASK1_TRAIN" "$TASK2_TRAIN" "$TASK3_TRAIN" "$TASK4_TRAIN")
-ALL_VAL=("$TASK1_VAL" "$TASK2_VAL" "$TASK3_VAL" "$TASK4_VAL")
-ALL_GPUS=("0" "1" "2" "3")
-
-# --- OPTION B: TEST HYPERTENSION ONLY (Comment this IN for test) ---
-# Note: We assign it to GPU 0. You can change "0" to any free GPU ID.
-# ALL_TRAIN=("$TASK3_TRAIN")
-# ALL_VAL=("$TASK3_VAL")
-# ALL_GPUS=("3")
-
 # ============================================================
-# AUTOMATIC PARSING & NAMING LOGIC
+# AUTOMATIC PARSING & NAMING LOGIC (before path changes)
 # ============================================================
 
 # Parse MODEL_SHORT_NAME from MODEL_NAME
 # Example: "Qwen/Qwen3-8B" -> "qwen3-8b"
 MODEL_SHORT_NAME=$(echo "$MODEL_NAME" | awk -F'/' '{print $NF}' | tr '[:upper:]' '[:lower:]')
 
-# Parse DATASET_NAME from task path (Maintains your original logic)
-DATASET_PATH=$(dirname $(dirname "$TASK1_TRAIN"))
-DATA_DIR=$(basename $(dirname "$DATASET_PATH"))
-DATASET_TYPE=$(basename "$DATASET_PATH")
-DATASET_NAME="${DATA_DIR}_${DATASET_TYPE}"
+# Parse DATASET_NAME from task path (use original path before /dev/shm copy)
+ORIG_DATASET_PATH=$(dirname $(dirname "$TASK1_TRAIN"))
+DATA_DIR_NAME=$(basename $(dirname "$ORIG_DATASET_PATH"))
+DATASET_TYPE=$(basename "$ORIG_DATASET_PATH")
+DATASET_NAME="${DATA_DIR_NAME}_${DATASET_TYPE}"
 DATASET_NAME=$(echo "$DATASET_NAME" | sed 's/data_//' | tr '_' '-' | tr '/' '-')
 
 # --- UPDATE: Added "unsloth-" prefix ---
 WANDB_PROJECT="unsloth-ehrshot-${MODEL_SHORT_NAME}-${DATASET_NAME}-r${LORA_RANK}"
 
 # --- UPDATE: Added "unsloth_" prefix to output directory ---
-OUTPUT_BASE_DIR="${SCRIPT_DIR}/unsloth_output_${MODEL_SHORT_NAME}_r${LORA_RANK}_$(basename $(dirname "$DATASET_PATH"))_$(basename "$DATASET_PATH")"
+OUTPUT_BASE_DIR="${SCRIPT_DIR}/unsloth_output_${MODEL_SHORT_NAME}_r${LORA_RANK}_${DATA_DIR_NAME}_${DATASET_TYPE}"
 
 # Update output paths for specific tasks
 TASK1_OUT="${OUTPUT_BASE_DIR}/acute_mi"
@@ -78,16 +77,27 @@ TASK3_OUT="${OUTPUT_BASE_DIR}/hypertension"
 TASK4_OUT="${OUTPUT_BASE_DIR}/hyperlipidemia"
 
 # --- OPTION A: RUN ALL (Comment this OUT for test) ---
+
 ALL_OUT=("$TASK1_OUT" "$TASK2_OUT" "$TASK3_OUT" "$TASK4_OUT")
+ALL_TRAIN=("$TASK1_TRAIN" "$TASK2_TRAIN" "$TASK3_TRAIN" "$TASK4_TRAIN")
+ALL_VAL=("$TASK1_VAL" "$TASK2_VAL" "$TASK3_VAL" "$TASK4_VAL")
+ALL_GPUS=("0" "1" "2" "3")
+
 
 # --- OPTION B: TEST HYPERTENSION ONLY (Comment this IN for test) ---
+
 # ALL_OUT=("$TASK3_OUT")
+# ALL_TRAIN=("$TASK3_TRAIN")
+# ALL_VAL=("$TASK3_VAL")
+# ALL_GPUS=("3")
+
 
 echo "Configuration:"
 echo "  Model: $MODEL_NAME -> $MODEL_SHORT_NAME"
 echo "  Python Script: $PYTHON_SCRIPT"
 echo "  WandB Project: $WANDB_PROJECT"
 echo "  Output Base Dir: $OUTPUT_BASE_DIR"
+echo "  Data Location: $DATA_DIR (RAM - /dev/shm)"
 echo ""
 
 mkdir -p "$OUTPUT_BASE_DIR"
