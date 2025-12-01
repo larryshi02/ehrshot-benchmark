@@ -12,6 +12,8 @@ import sys
 import json
 import argparse
 import numpy as np
+import hashlib
+import pickle
 from typing import List, Dict, Tuple, Optional
 from sklearn.cluster import KMeans
 from loguru import logger
@@ -72,18 +74,79 @@ def load_task_instructions(task_to_instructions_file: str) -> Dict[str, str]:
     return task_to_instructions
 
 
+def get_embedding_cache_key(texts: List[str], instructions: List[str]) -> str:
+    """
+    Generate a cache key based on texts and instructions.
+    
+    Args:
+        texts: List of text strings
+        instructions: List of instruction strings
+    
+    Returns:
+        SHA256 hash string for use as cache key
+    """
+    # Combine texts and instructions into a single string
+    combined = "\n".join([f"{inst}|||{text}" for inst, text in zip(instructions, texts)])
+    # Generate hash
+    hash_obj = hashlib.sha256(combined.encode('utf-8'))
+    return hash_obj.hexdigest()
+
+
+def load_embeddings_from_cache(cache_file: str) -> Optional[np.ndarray]:
+    """
+    Load embeddings from cache file if it exists.
+    
+    Args:
+        cache_file: Path to cache file
+    
+    Returns:
+        Embeddings array if cache exists, None otherwise
+    """
+    if os.path.exists(cache_file):
+        try:
+            logger.info(f"Loading embeddings from cache: {cache_file}")
+            with open(cache_file, 'rb') as f:
+                embeddings = pickle.load(f)
+            logger.info(f"Loaded embeddings with shape {embeddings.shape}")
+            return embeddings
+        except Exception as e:
+            logger.warning(f"Failed to load cache file {cache_file}: {e}")
+            return None
+    return None
+
+
+def save_embeddings_to_cache(embeddings: np.ndarray, cache_file: str) -> None:
+    """
+    Save embeddings to cache file.
+    
+    Args:
+        embeddings: Embeddings array to save
+        cache_file: Path to cache file
+    """
+    try:
+        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+        with open(cache_file, 'wb') as f:
+            pickle.dump(embeddings, f)
+        logger.info(f"Saved embeddings to cache: {cache_file}")
+    except Exception as e:
+        logger.warning(f"Failed to save cache file {cache_file}: {e}")
+
+
 def compute_embeddings(
     texts: List[str], 
     text_encoder: TextEncoder,
-    instructions: Optional[List[str]] = None
+    instructions: Optional[List[str]] = None,
+    cache_dir: Optional[str] = None
 ) -> np.ndarray:
     """
     Compute embeddings for a list of texts using Qwen2LLMEncoder.
+    Uses caching if cache_dir is provided.
     
     Args:
         texts: List of text strings to embed
         text_encoder: TextEncoder instance with Qwen2LLMEncoder
         instructions: Optional list of instructions (one per text, or None for all)
+        cache_dir: Optional directory to cache embeddings
     
     Returns:
         numpy array of embeddings with shape (len(texts), embedding_dim)
@@ -92,12 +155,27 @@ def compute_embeddings(
         # Use empty instructions if not provided
         instructions = [""] * len(texts)
     
+    # Try to load from cache if cache_dir is provided
+    if cache_dir:
+        cache_key = get_embedding_cache_key(texts, instructions)
+        cache_file = os.path.join(cache_dir, f"{cache_key}.pkl")
+        cached_embeddings = load_embeddings_from_cache(cache_file)
+        if cached_embeddings is not None:
+            return cached_embeddings
+    
     logger.info(f"Computing embeddings for {len(texts)} texts using Qwen2LLMEncoder")
     
     # Use TextEncoder.encode_texts which handles instruction formatting
     embeddings = text_encoder.encode_texts(instructions, texts, cache_dir=None)
     
     logger.info(f"Computed embeddings with shape {embeddings.shape}")
+    
+    # Save to cache if cache_dir is provided
+    if cache_dir:
+        cache_key = get_embedding_cache_key(texts, instructions)
+        cache_file = os.path.join(cache_dir, f"{cache_key}.pkl")
+        save_embeddings_to_cache(embeddings, cache_file)
+    
     return embeddings
 
 
@@ -147,7 +225,8 @@ def select_diverse_samples(
     task_name: str,
     task_to_instructions: Dict[str, str],
     n_pos: int = 20,
-    n_neg: int = 20
+    n_neg: int = 20,
+    cache_dir: Optional[str] = None
 ) -> Tuple[List[Dict], List[Dict]]:
     """
     Select diverse samples using k-means + medoids.
@@ -164,8 +243,13 @@ def select_diverse_samples(
         Tuple of (selected_positive_samples, selected_negative_samples)
     """
     # Get instruction for this task
-    instruction_key = TASK_TO_INSTRUCTION_KEY.get(task_name, '')
-    instruction = task_to_instructions.get(instruction_key, "")
+    TASK_PREDICTION_QUERIES: Dict[str, str] = {
+        "acute_mi": "Will the patient develop an acute myocardial infarction in the next year?",
+        "hypertension": "Will the patient develop hypertension in the next year?",
+        "hyperlipidemia": "Will the patient develop hyperlipidemia in the next year?",
+        "pancreatic_cancer": "Will the patient develop pancreatic cancer in the next year?",
+    }
+    instruction = TASK_PREDICTION_QUERIES.get(task_name, "")
     
     # Build full instruction with prefix if available
     instruction_prefix = task_to_instructions.get("instruction_prefix", "")
@@ -176,7 +260,7 @@ def select_diverse_samples(
     else:
         full_instruction = ""
     
-    logger.info(f"Using instruction for task {task_name}: {full_instruction[:100]}..." if full_instruction else "No instruction found")
+    logger.info(f"Using instruction for task {task_name}: {full_instruction[:200]}..." if full_instruction else "No instruction found")
     
     # Separate positive and negative examples
     positives = [ex for ex in data if ex.get('label_value', False) is True]
@@ -201,7 +285,7 @@ def select_diverse_samples(
         logger.info(f"Selecting {n_pos} diverse positive samples...")
         pos_texts = [ex.get('context', '') for ex in positives]
         pos_instructions = [full_instruction] * len(pos_texts)
-        pos_embeddings = compute_embeddings(pos_texts, text_encoder, pos_instructions)
+        pos_embeddings = compute_embeddings(pos_texts, text_encoder, pos_instructions, cache_dir)
         pos_example_indices = np.array(range(len(positives)))
         
         # Run k-means on positives
@@ -222,7 +306,7 @@ def select_diverse_samples(
         logger.info(f"Selecting {n_neg} diverse negative samples...")
         neg_texts = [ex.get('context', '') for ex in negatives]
         neg_instructions = [full_instruction] * len(neg_texts)
-        neg_embeddings = compute_embeddings(neg_texts, text_encoder, neg_instructions)
+        neg_embeddings = compute_embeddings(neg_texts, text_encoder, neg_instructions, cache_dir)
         neg_example_indices = np.array(range(len(negatives)))
         
         # Run k-means on negatives
@@ -248,7 +332,8 @@ def process_task(
     text_encoder: TextEncoder,
     task_to_instructions: Dict[str, str],
     n_pos: int = 20,
-    n_neg: int = 20
+    n_neg: int = 20,
+    cache_dir: Optional[str] = None
 ) -> None:
     """Process a single task to select diverse samples."""
     logger.info(f"\n{'='*60}")
@@ -264,7 +349,7 @@ def process_task(
     
     # Select diverse samples
     selected_pos, selected_neg = select_diverse_samples(
-        data, text_encoder, task_name, task_to_instructions, n_pos=n_pos, n_neg=n_neg
+        data, text_encoder, task_name, task_to_instructions, n_pos=n_pos, n_neg=n_neg, cache_dir=cache_dir
     )
     
     # Combine selected samples
@@ -335,6 +420,13 @@ def main():
         "--use_fallback_encoder",
         action="store_true",
         help="Use GTEQwen2-1.5B instead of 7B (smaller model, may avoid flash_attn issues)"
+    )
+    
+    parser.add_argument(
+        "--embedding_cache_dir",
+        type=str,
+        default=None,
+        help="Directory to cache embeddings (default: None, no caching). Set to enable caching."
     )
     
     parser.add_argument(
@@ -419,6 +511,16 @@ def main():
         logger.error("Try using --use_fallback_encoder as an alternative")
         raise
     
+    # Set up cache directory if provided
+    cache_dir = None
+    if args.embedding_cache_dir:
+        if not os.path.isabs(args.embedding_cache_dir):
+            cache_dir = os.path.join(project_root, args.embedding_cache_dir)
+        else:
+            cache_dir = args.embedding_cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+        logger.info(f"Using embedding cache directory: {cache_dir}")
+    
     # Process each task
     for task_name in args.tasks:
         try:
@@ -429,7 +531,8 @@ def main():
                 text_encoder=text_encoder,
                 task_to_instructions=task_to_instructions,
                 n_pos=args.n_pos,
-                n_neg=args.n_neg
+                n_neg=args.n_neg,
+                cache_dir=cache_dir
             )
         except Exception as e:
             logger.error(f"Error processing task {task_name}: {e}")

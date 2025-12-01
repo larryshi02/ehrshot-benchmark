@@ -52,9 +52,6 @@ def format_example_for_prompt(example: Dict, task_name: str) -> str:
     label = "Positive" if example.get('label_value', False) else "Negative"
     context = example.get('context', '')
     
-    # Truncate context if too long (keep first 2000 chars to fit in prompt)
-    if len(context) > 2000:
-        context = context[:2000] + "... [truncated]"
     
     return f"""Example {example.get('patient_id', 'unknown')} ({label}):
 {context}
@@ -105,7 +102,7 @@ Please provide:
 2. Key categories or dimensions to evaluate (e.g., risk factors, clinical indicators, lab values, medical history patterns)
 3. How to structure the analysis
 
-Within the rubric, encourage the user to fill out the fields, but not jump to any conclusions about the patient's risk for the task.
+Within the rubric, encourage the user to fill out the fields, but not jump to any conclusions about the patient's risk for the task. The rubric will be later used by other models to transform the patient's EHR and evaluate for the given task.
 
 Here are the {len(examples)} diverse examples:
 

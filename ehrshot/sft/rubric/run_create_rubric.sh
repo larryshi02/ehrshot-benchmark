@@ -15,8 +15,8 @@ TASK_TO_INSTRUCTIONS="${PROJECT_ROOT}/ehrshot/serialization/task_to_instructions
 # Default parameters
 MAX_COMPLETION_TOKENS=8192
 TEMPERATURE=1
-#TASKS="acute_mi hyperlipidemia hypertension pancreatic_cancer"
-TASKS="acute_mi"
+TASKS="acute_mi hyperlipidemia hypertension pancreatic_cancer"
+#TASKS="acute_mi"
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
