@@ -7,22 +7,41 @@ import threading
 from pathlib import Path
 
 # --- CONFIGURATION ---
-EVAL_NAME = "eval_experiment_yn"
+EVAL_NAME = "eval_experiment_hfpeft_yn"
 MODEL_BASE = "Qwen/Qwen3-8B"
 DATA_ROOT = "/dev/shm/ehrshot-data/serialized_multi_task_data"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_ROOT = os.path.join(SCRIPT_DIR, EVAL_NAME)
-TRAINING_OUTPUT_DIR = os.path.join(SCRIPT_DIR, "unsloth_output_qwen3-8b_r16_data_gpt-5-mini_sft_rt_yn")
+TRAINING_OUTPUT_DIR = os.path.join(SCRIPT_DIR, "output_qwen3-8b_r16_data_gpt-5-mini_balanced_new_sft_supervised_reasoning_traces")
 
 WORKER_SCRIPT = "eval_vllm_worker.py"
 AGGREGATOR_SCRIPT = "eval_vllm_metric_calculator.py" # Check spelling!
 
 # SOURCE_TASKS = ["acute_mi", "pancreatic_cancer", "hypertension", "hyperlipidemia"]
 
-SOURCE_TASKS = ["hypertension", "hyperlipidemia"]
+SOURCE_TASKS = ["hypertension", "pancreatic_cancer", "hyperlipidemia", "acute_mi"]
 TARGET_TASKS = ["acute_mi", "pancreatic_cancer", "hypertension", "hyperlipidemia"]
 
-GPU_IDS = [0, 1, 2, 3] # The GPUs you want to use
+TASK_GRID = [
+    # ["hypertension", "hypertension"],
+    # ["hyperlipidemia", "hyperlipidemia"],
+    ["hypertension", "pancreatic_cancer"],
+    ["hypertension", "acute_mi"],
+    ["hyperlipidemia", "acute_mi"],
+    ["hyperlipidemia", "pancreatic_cancer"],
+    ["hyperlipidemia", "hypertension"],
+    ["hypertension", "hyperlipidemia"],
+    # ["acute_mi", "acute_mi"],
+    # ["pancreatic_cancer", "pancreatic_cancer"],
+    ["acute_mi", "pancreatic_cancer"],
+    ["pancreatic_cancer", "acute_mi"],
+    ["acute_mi", "hypertension"],
+    ["acute_mi", "hyperlipidemia"],
+    ["pancreatic_cancer", "hypertension"],
+    ["pancreatic_cancer", "hyperlipidemia"]
+]
+
+GPU_IDS = [2, 3] # The GPUs you want to use
 
 # --- HELPER: Find Latest Checkpoint ---
 def get_latest_checkpoint(base_dir):
@@ -107,11 +126,16 @@ def main():
     # We create 16 total jobs
     job_queue = queue.Queue()
     
+    # print("--- Queueing Jobs ---")
+    # for source_model in SOURCE_TASKS:
+    #     for target_task in TARGET_TASKS:
+    #         job_queue.put((source_model, target_task))
+    #         print(f"  Queued: {source_model} evaluated on {target_task}")
+
     print("--- Queueing Jobs ---")
-    for source_model in SOURCE_TASKS:
-        for target_task in TARGET_TASKS:
-            job_queue.put((source_model, target_task))
-            print(f"  Queued: {source_model} evaluated on {target_task}")
+    for source_model, target_task in TASK_GRID:
+        job_queue.put((source_model, target_task))
+        print(f"  Queued: {source_model} evaluated on {target_task}")
     
     print(f"\nTotal Jobs: {job_queue.qsize()}")
     print("Starting Workers...")

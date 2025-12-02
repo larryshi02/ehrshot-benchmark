@@ -39,13 +39,12 @@ class SFTConfig:
     # Hardware / Precision
     bf16: bool = True
     
-    # Optimization (Total Batch Size = 2 * 4 * Num_GPUs = 8 per GPU effective)
     # A100 80GB with Unsloth has huge headroom, so we use Batch Size 8 directly.
     per_device_train_batch_size: int = 12
     per_device_eval_batch_size: int = 1
     gradient_accumulation_steps: int = 1
     learning_rate: float = 1e-4
-    num_train_epochs: int = 2
+    num_train_epochs: int = 3
     weight_decay: float = 0.01
     warmup_ratio: float = 0.03
     lr_scheduler_type: str = "cosine"
@@ -213,8 +212,8 @@ def run_training(model, tokenizer, datasets, output_dir, wandb_project: str, wan
         optim="adamw_torch_fused",
         gradient_checkpointing=config.gradient_checkpointing,
         logging_steps=10,
-        eval_steps=100,
-        save_steps=100,
+        eval_steps=50,
+        save_steps=50,
         eval_strategy="steps",
         save_strategy="steps",
         save_total_limit=10,

@@ -65,10 +65,10 @@ DATASET_NAME="${DATA_DIR_NAME}_${DATASET_TYPE}"
 DATASET_NAME=$(echo "$DATASET_NAME" | sed 's/data_//' | tr '_' '-' | tr '/' '-')
 
 # --- UPDATE: Added "unsloth-" prefix ---
-WANDB_PROJECT="unsloth-ehrshot-${MODEL_SHORT_NAME}-${DATASET_NAME}-r${LORA_RANK}"
+WANDB_PROJECT="epochs3-unsloth-ehrshot-${MODEL_SHORT_NAME}-${DATASET_NAME}-r${LORA_RANK}"
 
 # --- UPDATE: Added "unsloth_" prefix to output directory ---
-OUTPUT_BASE_DIR="${SCRIPT_DIR}/unsloth_output_${MODEL_SHORT_NAME}_r${LORA_RANK}_${DATA_DIR_NAME}_${DATASET_TYPE}"
+OUTPUT_BASE_DIR="${SCRIPT_DIR}/epochs3_unsloth_output_${MODEL_SHORT_NAME}_r${LORA_RANK}_${DATA_DIR_NAME}_${DATASET_TYPE}"
 
 # Update output paths for specific tasks
 TASK1_OUT="${OUTPUT_BASE_DIR}/acute_mi"
