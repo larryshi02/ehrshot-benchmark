@@ -1028,13 +1028,13 @@ def main() -> None:
             args.output_dir, "train_all", task_name, "backwards_reasoning"
         )
         train_sft_file = build_output_path(
-            args.output_dir, "train_all", task_name, "backwards_sft_dataset"
+            args.output_dir, "train_all", task_name, "sft_dataset"
         )
         val_output_file = build_output_path(
             args.output_dir, "val", task_name, "backwards_reasoning"
         )
         val_sft_file = build_output_path(
-            args.output_dir, "val", task_name, "backwards_sft_dataset"
+            args.output_dir, "val", task_name, "sft_dataset"
         )
 
         stats = pipeline.process_task(
