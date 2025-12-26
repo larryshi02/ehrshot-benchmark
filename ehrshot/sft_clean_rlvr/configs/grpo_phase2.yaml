@@ -1,0 +1,80 @@
+# =============================================================================
+# Phase 2: Multi-GPU GRPO Configuration (DDP)
+# =============================================================================
+# 
+# This configuration is used for Phase 2 production training with DDP.
+# Optimized for 4 x A100 80GB with balanced memory/throughput settings.
+#
+# Usage:
+#   torchrun --nproc_per_node=4 train_grpo_ddp.py --config configs/grpo_phase2.yaml
+#
+# =============================================================================
+
+# Model Configuration
+model:
+  name: "Qwen/Qwen3-8B"
+  max_seq_length: 12288
+  dtype: "bfloat16"
+  
+# LoRA Configuration (must match SFT checkpoint)
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+# GRPO Training Configuration
+grpo:
+  # Generation settings
+  num_generations: 10           # Samples per prompt
+  max_completion_length: 2048   # Max response tokens
+  temperature: 0.7              # Sampling temperature
+  top_p: 0.9                    # Nucleus sampling threshold
+  
+  # Training settings
+  learning_rate: 5.0e-6         # Lower than SFT
+  beta: 0.05                    # KL penalty coefficient
+  max_steps: 1000               # Full training run
+  
+  # Batch settings (DDP with 4 GPUs)
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 2
+  # Effective batch: 2 * 2 * 4 GPUs = 16 prompts
+  # Completions per step: 16 * 10 = 160
+  
+  # Optimization
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  gradient_checkpointing: true
+  
+  # DDP settings
+  ddp_find_unused_parameters: false
+  
+  # Logging
+  logging_steps: 10
+  save_steps: 100
+  eval_steps: 100
+
+# Data Configuration
+data:
+  tasks:                        # All tasks for aggregated training
+    - "acute_mi"
+    - "hyperlipidemia"
+    - "hypertension"
+    - "pancreatic_cancer"
+  split: "train_orig"           # Use original training split
+  balance_classes: true         # Balance within each task
+  seed: 42
+
+# Hardware
+hardware:
+  num_gpus: 4
+  bf16: true
+  gpu_memory_utilization: 0.90

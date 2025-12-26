@@ -1,0 +1,69 @@
+# =============================================================================
+# Phase 1: Single-GPU GRPO Configuration
+# =============================================================================
+# 
+# This configuration is used for Phase 1 validation on a single GPU.
+# Optimized for A100 80GB with conservative memory settings.
+#
+# Usage:
+#   python train_grpo_single.py --config configs/grpo_phase1.yaml
+#
+# =============================================================================
+
+# Model Configuration
+model:
+  name: "Qwen/Qwen3-8B"
+  max_seq_length: 12288
+  dtype: "bfloat16"
+  
+# LoRA Configuration (must match SFT checkpoint)
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+# GRPO Training Configuration
+grpo:
+  # Generation settings
+  num_generations: 10           # Samples per prompt
+  max_completion_length: 2048   # Max response tokens (P95 is ~1500)
+  temperature: 0.7              # Sampling temperature
+  top_p: 0.9                    # Nucleus sampling threshold
+  
+  # Training settings
+  learning_rate: 5.0e-6         # Lower than SFT (RL is sensitive)
+  beta: 0.05                    # KL penalty coefficient
+  max_steps: 500                # Validation run
+  
+  # Batch settings (single GPU - conservative)
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 4
+  
+  # Optimization
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  gradient_checkpointing: true
+  
+  # Logging
+  logging_steps: 10
+  save_steps: 100
+  eval_steps: 100
+
+# Data Configuration
+data:
+  split: "train_orig"           # Use original training split
+  balance_classes: true         # Balance positives and negatives
+  seed: 42
+
+# Hardware
+hardware:
+  bf16: true
+  gpu_memory_utilization: 0.90
