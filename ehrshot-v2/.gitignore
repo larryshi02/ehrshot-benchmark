@@ -1,0 +1,14 @@
+# Generated data
+data/
+
+# Azure credentials
+config/azure_config.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor
+.vscode/
+*.swp
